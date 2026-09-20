@@ -205,7 +205,9 @@ describe("resolveTier", () => {
 
 	test("preflight actions map through the route table", () => {
 		expect(resolveTier(actionDecision("fast_model_direct"), DEFAULT_CONFIG)).toBe("fast");
-		expect(resolveTier(actionDecision("strong_model_plan"), DEFAULT_CONFIG)).toBe("deep");
+		expect(resolveTier(actionDecision("strong_model_plan"), DEFAULT_CONFIG)).toBe("planner");
+		expect(resolveTier(actionDecision("plan_first"), DEFAULT_CONFIG)).toBe("planner");
+		expect(resolveTier(actionDecision("escalate_model"), DEFAULT_CONFIG)).toBe("deep");
 	});
 
 	test('a "keep" mapping leaves the model alone', () => {
@@ -220,7 +222,7 @@ describe("resolveTier", () => {
 		const cfg = mergeConfig({ mode: "preflight" });
 		const route = planRoute(actionDecision("strong_model_plan", true), cfg, () => 0);
 		expect(route.kind).toBe("switch");
-		expect(route.kind === "switch" && route.tier).toBe("deep");
+		expect(route.kind === "switch" && route.tier).toBe("planner");
 	});
 });
 
@@ -296,9 +298,10 @@ describe("resolveFirst", () => {
 describe("dedicated roles", () => {
 	test("one role per default tier, with its built-in fallbacks", () => {
 		const roles = dedicatedRoles(DEFAULT_CONFIG);
-		expect(Object.keys(roles).sort()).toEqual(["jev-deep", "jev-fast", "jev-standard"]);
+		expect(Object.keys(roles).sort()).toEqual(["jev-deep", "jev-fast", "jev-planner", "jev-standard"]);
 		expect(roles["jev-fast"]).toEqual({ tier: "fast", fallbacks: ["tiny", "smol"] });
 		expect(roles["jev-deep"]).toEqual({ tier: "deep", fallbacks: ["task", "plan"] });
+		expect(roles["jev-planner"]).toEqual({ tier: "planner", fallbacks: ["plan"] });
 	});
 
 	test("seed values come from the first configured fallback, never invented", () => {
@@ -380,7 +383,7 @@ describe("seedModelRoles (temp file, Bun.YAML verifier)", () => {
 		const report = seedModelRoles(DEFAULT_CONFIG, { path, yaml, dryRun: true });
 		expect(report.error).toBeUndefined();
 		expect(report.added.sort()).toEqual(["jev-deep", "jev-fast"]);
-		expect(report.unseeded).toEqual(["jev-standard"]);
+		expect(report.unseeded.sort()).toEqual(["jev-planner", "jev-standard"]);
 		expect(report.written).toBe(false);
 		expect(readFileSync(path, "utf8")).toBe(before);
 	});
@@ -434,7 +437,7 @@ describe("seedModelRoles (temp file, Bun.YAML verifier)", () => {
 		writeFileSync(path, "theme:\n  dark: molten\n");
 		const report = seedModelRoles(DEFAULT_CONFIG, { path, yaml });
 		expect(report.written).toBe(false);
-		expect(report.unseeded.sort()).toEqual(["jev-deep", "jev-fast", "jev-standard"]);
+		expect(report.unseeded.sort()).toEqual(["jev-deep", "jev-fast", "jev-planner", "jev-standard"]);
 		expect(report.snippet).toContain("jev-deep: <provider/model>");
 	});
 });

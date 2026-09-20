@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Oh My Pi extension: pick the model and thinking effort for each prompt with TypeSafe Jev.",
-  "bin": { "jev-router": "./bin/jev-router.ts" },
+  "bin": {
+    "jev-router": "./bin/jev-router.ts"
+  },
   "omp": {
     "extensions": ["./extensions/jev-router.ts"]
   },
@@ -22,5 +24,8 @@
     "@types/bun": "^1.4.2",
     "@types/node": "^20.11.29",
     "typescript": "^5.4.2"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.8.1"
   }
 }

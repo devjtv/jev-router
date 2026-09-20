@@ -218,18 +218,26 @@ export const DEFAULT_CONFIG: RouterConfig = {
 			],
 		},
 		deep: {
-			description: "coordinated change across modules, unclear scope, or correctness that is expensive to get wrong",
+			description: "coordinated change across modules, unclear scope, or correctness that is expensive to get wrong — implement it",
 			candidates: [
 				{ models: ["@jev-deep", "@task"], effort: "high" },
 				{ models: ["@jev-deep", "@plan"], effort: "xhigh" },
 			],
 		},
+		// Costliest tier, last on purpose: the confidence floor escalates toward
+		// the end of this list. Planning is not "deep but more" — it is a different
+		// job: the request asks for a design, a decision, a review of options, or
+		// scoping before anyone edits. Maximum reasoning, no rush.
+		planner: {
+			description: "asks for a plan, design, architecture, trade-off analysis, review, or scoping before implementation; open-ended decisions rather than edits",
+			candidates: [{ models: ["@jev-planner", "@plan"], effort: "xhigh" }],
+		},
 	},
 	route: {
 		fast_model_direct: "fast",
 		scout_first: "fast",
-		plan_first: "standard",
-		strong_model_plan: "deep",
+		plan_first: "planner",
+		strong_model_plan: "planner",
 		escalate_model: "deep",
 		ask_user: "keep",
 	},
@@ -238,7 +246,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
 		port: 47_131,
 		upstream: "https://api.anthropic.com",
 		// Overridable per tier. Anything the upstream accepts is valid here.
-		models: { fast: "claude-haiku-4-5", standard: "claude-sonnet-4-6", deep: "claude-opus-5" },
+		models: { fast: "claude-haiku-4-5", standard: "claude-sonnet-4-6", deep: "claude-opus-5", planner: "claude-opus-5" },
 		fallbackModel: "claude-opus-5",
 		effort: true,
 		stripThinkingOnSwitch: true,

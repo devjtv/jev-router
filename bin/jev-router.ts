@@ -30,12 +30,14 @@ import {
 	stop,
 	tailLog,
 	uninstallService,
+	update,
 	writeClaudeSettings,
 	statusLineCommand,
 	statusLineSetting,
 	type Status,
 } from "../claude-code/proxy/daemon.ts";
 import { claudeEnv, claudeSettings } from "../claude-code/proxy/server.ts";
+import { setup } from "../claude-code/setup.ts";
 import { tierModel } from "../claude-code/proxy/routing.ts";
 
 const [cmd = "help", ...rest] = process.argv.slice(2);
@@ -62,6 +64,10 @@ function fmtStatus(s: Status): string {
 }
 
 switch (cmd) {
+	case "setup": {
+		await setup({ yes: flag("--yes") || flag("-y") });
+		break;
+	}
 	case "serve": {
 		await serveForeground({ quiet: flag("--quiet") });
 		break;
@@ -123,7 +129,9 @@ switch (cmd) {
 		const url = s.running ? s.url : `http://127.0.0.1:${cfg.claudeCode.port}`;
 		const env = claudeEnv(url, cfg);
 		if (flag("--write")) {
-			const r = writeClaudeSettings(cfg, url);
+			const slFlag = rest.find((a) => a.startsWith("--statusline="))?.slice("--statusline=".length);
+			const slMode = slFlag === "replace" || slFlag === "chain" || slFlag === "skip" || slFlag === "if-absent" ? slFlag : "if-absent";
+			const r = writeClaudeSettings(cfg, url, claudeSettingsPath(), slMode);
 			if (r.error) {
 				console.error(`not written: ${r.error}`);
 				process.exit(1);
@@ -139,6 +147,11 @@ switch (cmd) {
 	case "statusline": {
 		await statusLineCommand();
 		break;
+	}
+	case "update": {
+		const r = await update();
+		for (const line of r.lines) console.log(line);
+		process.exit(r.ok ? 0 : 1);
 	}
 	case "logs": {
 		if (flag("--daemon")) console.log(daemonLogPath());
@@ -171,13 +184,16 @@ switch (cmd) {
 			[
 				"jev-router — Jev-routed gateway model for Claude Code",
 				"",
+				"  setup [--yes]               guided onboarding: key, tiers, daemon, Claude Code wiring",
 				"  serve                       run in the foreground",
 				"  start | stop | restart      background process (pidfile in ~/.omp/agent)",
 				"  status                      pid, url, tiers, sessions",
 				"  reload                      re-read jev-router.json without dropping sessions",
 				"  service install|uninstall|show   start at login (systemd --user / launchd / schtasks)",
 				"  claude [args…]              run Claude Code on the gateway model",
-				"  env [--write]               env block for Claude Code; --write merges into settings.json",
+				"  env [--write] [--statusline=if-absent|replace|chain|skip]",
+				"                              env block for Claude Code; --write merges into settings.json",
+				"  update                      pull the latest jev-router, reinstall deps, restart the daemon",
 				"  logs [-n N] [-f]            routing log",
 				"  statusline                  Claude Code statusLine command: shows this session's route",
 				"  route <text>                dry-run the gate",

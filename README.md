@@ -53,7 +53,7 @@ Install jev-router (https://github.com/devjtv/jev-router) for me. Steps: (1) git
 For Claude Code (the gateway model, see [below](#claude-code)):
 
 ```
-Set up the jev-router gateway model for Claude Code (https://github.com/devjtv/jev-router). Steps: (1) `bun add -g github:devjtv/jev-router` so `jev-router` is on PATH (if that fails, git clone to ~/.jev-router, `bun install`, `bun link`); (2) make sure a Jev key is available: one of OPENROUTER_API_KEY / TYPESAFE_API_KEY / JEV_API_KEY in the environment, or ~/.jev-gate/config.json, or ~/.omp/agent/.secrets/openrouter.key (mode 600) — ask me for an OpenRouter key if none exists; (3) run `jev-router start` then `jev-router status` and show me the output; (4) run `jev-router route "fix the typo in the README"` to prove the gate answers; (5) ask me whether to (a) run `jev-router env --write` so plain `claude` uses the jev-router model from now on, and (b) run `jev-router service install` so the proxy starts at login — do neither without my yes. Do not edit ~/.claude/settings.json by hand; `env --write` does it with a backup.
+Set up jev-router for Claude Code (https://github.com/devjtv/jev-router): run `bun add -g github:devjtv/jev-router` (if that fails: git clone to ~/.jev-router, `bun install`, `bun link`), then run `jev-router setup` interactively in my terminal and let me answer its prompts — it asks for an OpenRouter key if none is found, picks tier models, starts the daemon, wires ~/.claude/settings.json with a backup, and ends with a live dry run. If you cannot run it interactively, run `jev-router setup --yes` and show me its output, then `jev-router status`. Do not edit ~/.claude/settings.json or ~/.omp/agent/jev-router.json by hand.
 ```
 
 ## Two decision modes
@@ -71,7 +71,7 @@ downgrades.
 ## Dedicated roles
 
 Every tier gets its own OMP model role — `@jev-fast`, `@jev-standard`,
-`@jev-deep` — so you point each tier at an exact model without touching the
+`@jev-deep`, `@jev-planner` — so you point each tier at an exact model without touching the
 built-in `tiny`/`smol`/`task`/`plan` roles other tools may also use. A
 candidate is an **ordered spec list**; the first spec that resolves to an
 authenticated model wins:
@@ -199,16 +199,18 @@ routing or invert your tiers.
     "standard": { "description": "a real change in one or two files",
                   "candidates": [{ "models": ["@jev-standard", "@smol"], "effort": "medium" },
                                  { "models": ["@jev-standard", "@default"], "effort": "high" }] },
-    "deep":     { "description": "cross-module change, unclear scope, expensive to get wrong",
+    "deep":     { "description": "cross-module change, unclear scope, expensive to get wrong — implement it",
                   "candidates": [{ "models": ["@jev-deep", "@task"], "effort": "high" },
-                                 { "models": ["@jev-deep", "@plan"], "effort": "xhigh" }] }
+                                 { "models": ["@jev-deep", "@plan"], "effort": "xhigh" }] },
+    "planner":  { "description": "asks for a plan, design, trade-offs, review or scoping before implementation",
+                  "candidates": [{ "models": ["@jev-planner", "@plan"], "effort": "xhigh" }] }
   },
 
   "route": {                    // preflight verdict action -> tier, or "keep"
     "fast_model_direct": "fast",
     "scout_first": "fast",
-    "plan_first": "standard",
-    "strong_model_plan": "deep",
+    "plan_first": "planner",
+    "strong_model_plan": "planner",
     "escalate_model": "deep",
     "ask_user": "keep"
   }
@@ -297,17 +299,29 @@ lists every live session's pin.
 
 ### CLI and background service
 
+Two commands from nothing to routing:
+
 ```bash
 bun add -g github:devjtv/jev-router      # or, in a clone: bun link  → `jev-router` on PATH
+jev-router setup                          # guided: key (verified live) → tier models → preferences → daemon → Claude Code wiring → dry run
+```
 
+`setup` detects what you already have, asks only what it cannot infer, merges
+into existing files instead of overwriting them, and ends with two real gate
+answers so you see a route before trusting it. `--yes` takes every default
+(also what a non-TTY gets). Everything it does is also a plain command:
+
+```bash
 jev-router start                          # background proxy; pidfile in ~/.omp/agent, log in ~/.omp/agent/jev-router-proxy.log
 jev-router status                         # pid, url, tier → model map, live sessions
-jev-router env --write                    # merge env + modelOverrides + statusLine into ~/.claude/settings.json (backs up first)
+jev-router env --write [--statusline=if-absent|replace|chain|skip]
+                                          # merge env + modelOverrides (+ statusline) into ~/.claude/settings.json, with a backup
 claude                                    # …then plain claude runs on the gateway model, showing as "Opus 5"
 
-jev-router service install                # start at login: systemd --user / launchd / Windows Task Scheduler
+jev-router service install                # start at login: systemd --user / launchd / Task Scheduler (falls back to the Startup folder)
 jev-router service show                   # print the unit/plist/task it would write
 jev-router claude -p "fix the typo"       # one session; reuses the daemon, or runs a private proxy that dies with claude
+jev-router update                         # git pull --ff-only (or bun add -g again), bun install, restart the daemon
 jev-router reload                         # re-read jev-router.json without dropping sessions (also: SIGHUP)
 jev-router logs -f                        # follow the routing log
 jev-router route "make retries idempotent across three modules"   # dry-run the gate
@@ -352,7 +366,7 @@ Configuration lives under `claudeCode` in the same `jev-router.json`:
   "model": "jev-router",                 // the picker entry and wire name
   "port": 47131,
   "upstream": "https://api.anthropic.com",
-  "models": { "fast": "claude-haiku-4-5", "standard": "claude-sonnet-4-6", "deep": "claude-opus-5" },
+  "models": { "fast": "claude-haiku-4-5", "standard": "claude-sonnet-4-6", "deep": "claude-opus-5", "planner": "claude-opus-5" },
   "fallbackModel": "claude-opus-5",      // gate down, image turn under onImages: "skip", proxy restarted mid-turn
   "effort": true,                        // apply the candidate's effort as output_config.effort
   "stripThinkingOnSwitch": true,         // drop prior thinking blocks when the model changes between turns

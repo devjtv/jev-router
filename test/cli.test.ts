@@ -11,7 +11,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../extensions/jev-router.ts";
-import { mergeClaudeSettings, readPidFile, renderStatusLine, serviceDefinition, statusLineSetting, writePidFile, BIN } from "../claude-code/proxy/daemon.ts";
+import { chainedStatusLine, mergeClaudeSettings, readPidFile, renderStatusLine, serviceDefinition, statusLineSetting, writePidFile, BIN } from "../claude-code/proxy/daemon.ts";
+import { configPatch, patchConfigText } from "../claude-code/setup.ts";
 import { claudeEnv, claudeSettings } from "../claude-code/proxy/server.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "jev-router-cli-"));
@@ -103,6 +104,67 @@ describe("status line", () => {
 		const kept = mergeClaudeSettings(JSON.stringify({ statusLine: mine }), env, add);
 		expect(JSON.parse(kept.text).statusLine).toEqual(mine);
 		expect(kept.changed).not.toContain("statusLine");
+	});
+	test("replace and chain modes, and idempotence once ours is installed", () => {
+		const sl = statusLineSetting("/usr/bin/bun", "/opt/jr/bin/jev-router.ts");
+		const env = claudeEnv("http://127.0.0.1:1", DEFAULT_CONFIG);
+		const base = claudeSettings(DEFAULT_CONFIG);
+		const mine = { type: "command", command: "echo 'it''s mine'" };
+		const withMine = JSON.stringify({ statusLine: mine });
+
+		const replaced = mergeClaudeSettings(withMine, env, { ...base, statusLine: sl, statusLineMode: "replace" });
+		expect(JSON.parse(replaced.text).statusLine).toEqual(sl);
+		expect(replaced.changed).toContain("statusLine (replaced)");
+
+		const chained = mergeClaudeSettings(withMine, env, { ...base, statusLine: sl, statusLineMode: "chain" });
+		const cmd = (JSON.parse(chained.text).statusLine as { command: string }).command;
+		expect(cmd).toBe(`j=$(cat); o=$(printf '%s' "$j" | ${sl.command}); t=$(printf '%s' "$j" | sh -c 'echo '\\''it'\\'''\\''s mine'\\'''); printf '%s\\n%s\\n' "$o" "$t"`);
+		expect(chained.changed).toContain("statusLine (chained above yours)");
+		// Chaining again does not nest.
+		const again = mergeClaudeSettings(chained.text, env, { ...base, statusLine: sl, statusLineMode: "chain" });
+		expect(again.changed.filter((c) => c.startsWith("statusLine"))).toEqual([]);
+
+		const skipped = mergeClaudeSettings(withMine, env, { ...base, statusLine: sl, statusLineMode: "skip" });
+		expect(JSON.parse(skipped.text).statusLine).toEqual(mine);
+		const skippedEmpty = mergeClaudeSettings("", env, { ...base, statusLine: sl, statusLineMode: "skip" });
+		expect(JSON.parse(skippedEmpty.text).statusLine).toBeUndefined();
+	});
+
+	test("the chained command really feeds both sides the same stdin", async () => {
+		const sh = Bun.which("sh");
+		if (!sh) return; // no POSIX shell on this box; the command shape is asserted above
+		const { command } = chainedStatusLine("sed 's/^/A:/'", "sed 's/^/B:/'");
+		const proc = Bun.spawn([sh, "-c", command], { stdin: new Response("hello").body ?? undefined, stdout: "pipe" });
+		const out = await new Response(proc.stdout).text();
+		expect(out.trim().split("\n")).toEqual(["A:hello", "B:hello"]);
+	});
+});
+
+describe("setup config patch", () => {
+	test("merges onto an existing file, keeping unknown keys and nested claudeCode entries", () => {
+		const existing = JSON.stringify({ log: true, tiers: { fast: { candidates: [] } }, claudeCode: { port: 5000, models: { fast: "x" } } });
+		const patch = configPatch({
+			models: { fast: "claude-haiku-4-5", deep: "claude-opus-5" },
+			behavesAs: "claude-opus-5",
+			shadow: true,
+			subagents: "inherit",
+			cacheGuardMode: "keep",
+			writeSettings: true,
+			installService: false,
+		});
+		const r = patchConfigText(existing, patch);
+		expect(r.error).toBeUndefined();
+		const out = JSON.parse(r.text) as Record<string, unknown> & { claudeCode: Record<string, unknown> };
+		expect(out.log).toBe(true);
+		expect(out.tiers).toEqual({ fast: { candidates: [] } });
+		expect(out.shadow).toBe(true);
+		expect(out.cacheGuardMode).toBe("keep");
+		expect(out.claudeCode.port).toBe(5000); // untouched
+		expect(out.claudeCode.models).toEqual({ fast: "claude-haiku-4-5", deep: "claude-opus-5" });
+		expect(out.claudeCode.fallbackModel).toBe("claude-opus-5");
+		expect(out.claudeCode.subagents).toBe("inherit");
+		expect(patchConfigText("{nope", patch).error).toContain("does not parse");
+		expect(JSON.parse(patchConfigText("", patch).text).enabled).toBe(true);
 	});
 });
 

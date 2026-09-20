@@ -215,8 +215,8 @@ export function serviceDefinition(bun: string = process.execPath, home: string =
 	};
 }
 
-function run(cmd: string[]): { ok: boolean; out: string } {
-	const p = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe" });
+function run(cmd: string[], cwd?: string): { ok: boolean; out: string } {
+	const p = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe", cwd });
 	return { ok: p.exitCode === 0, out: `${p.stdout.toString()}${p.stderr.toString()}`.trim() };
 }
 
@@ -243,9 +243,29 @@ export async function installService(): Promise<ServiceReport> {
 	}
 	const create = run(["schtasks", "/Create", "/F", "/TN", SERVICE_NAME, "/SC", "ONLOGON", "/RL", "LIMITED", "/TR", `"${process.execPath}" "${BIN}" start`]);
 	commands.push(`schtasks /Create … → ${create.ok ? "ok" : create.out}`);
+	let path = def.path;
+	if (!create.ok) {
+		// Task Scheduler is often locked down by policy ("Access is denied" on an
+		// ordinary user account). The Startup folder needs no privilege at all.
+		const startup = startupShortcutPath();
+		try {
+			mkdirSync(dirname(startup), { recursive: true });
+		} catch (err) {
+			// Bun on Windows reports EEXIST for some shell folders even with recursive.
+			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+		}
+		writeFileSync(startup, `@echo off\r\nstart "" /min "${process.execPath}" "${BIN}" start\r\n`);
+		commands.push(`fell back to Startup folder → ${startup}`);
+		path = startup;
+	}
 	const started = await start();
 	commands.push(`start now → ${started.running ? started.url : started.reason}`);
-	return { platform: def.platform, path: def.path, commands, note: `logs: ${daemonLogPath()}` };
+	return { platform: def.platform, path, commands, note: `logs: ${daemonLogPath()}` };
+}
+
+/** `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\jev-router.cmd` */
+export function startupShortcutPath(env: NodeJS.ProcessEnv = process.env): string {
+	return join(env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup", `${SERVICE_NAME}.cmd`);
 }
 
 export async function uninstallService(): Promise<ServiceReport> {
@@ -265,6 +285,11 @@ export async function uninstallService(): Promise<ServiceReport> {
 	} else {
 		const r = run(["schtasks", "/Delete", "/F", "/TN", SERVICE_NAME]);
 		commands.push(`schtasks /Delete /TN ${SERVICE_NAME} → ${r.ok ? "ok" : r.out}`);
+		const startup = startupShortcutPath();
+		if (existsSync(startup)) {
+			rmSync(startup, { force: true });
+			commands.push(`removed ${startup}`);
+		}
 	}
 	return { platform: def.platform, path: def.path, commands };
 }
@@ -290,16 +315,90 @@ export function statusLineSetting(bun: string = process.execPath, bin: string = 
 	return { type: "command", command: `${q(bun)} ${q(bin)} statusline` };
 }
 
+// ----------------------------------------------------------------------------
+// Self-update
+// ----------------------------------------------------------------------------
+
+export const REPO_ROOT = resolve(import.meta.dir, "..", "..");
+const REPO_SPEC = "github:devjtv/jev-router";
+
+/**
+ * Bring this install up to date. A git checkout (`bun link` or a clone) gets a
+ * fast-forward pull; a `bun add -g` install is re-added. Either way the deps are
+ * reinstalled and a running daemon is restarted so the new code serves.
+ */
+export async function update(): Promise<{ ok: boolean; lines: string[] }> {
+	const lines: string[] = [];
+	const isGit = existsSync(join(REPO_ROOT, ".git"));
+	let changed = true;
+	if (isGit) {
+		const before = run(["git", "-C", REPO_ROOT, "rev-parse", "--short", "HEAD"]).out;
+		const dirty = run(["git", "-C", REPO_ROOT, "status", "--porcelain"]).out;
+		if (dirty) {
+			lines.push(`working tree at ${REPO_ROOT} has local changes; commit or stash them first:\n${dirty}`);
+			return { ok: false, lines };
+		}
+		const pull = run(["git", "-C", REPO_ROOT, "pull", "--ff-only"]);
+		if (!pull.ok) {
+			lines.push(`git pull failed: ${pull.out}`);
+			return { ok: false, lines };
+		}
+		const after = run(["git", "-C", REPO_ROOT, "rev-parse", "--short", "HEAD"]).out;
+		changed = before !== after;
+		lines.push(changed ? `${before} → ${after}` : `already up to date (${after})`);
+		if (changed) {
+			const log = run(["git", "-C", REPO_ROOT, "log", "--oneline", `${before}..${after}`]).out;
+			for (const l of log.split("\n").filter(Boolean)) lines.push(`  ${l}`);
+		}
+		const deps = run([process.execPath, "install"], REPO_ROOT);
+		lines.push(`bun install → ${deps.ok ? "ok" : deps.out}`);
+	} else {
+		const add = run([process.execPath, "add", "-g", REPO_SPEC]);
+		lines.push(`bun add -g ${REPO_SPEC} → ${add.ok ? "ok" : add.out}`);
+		if (!add.ok) return { ok: false, lines };
+	}
+	const s = await status();
+	if (s.running) {
+		await stop();
+		const again = await start();
+		lines.push(again.running ? `daemon restarted on ${again.url}` : `daemon did not come back: ${again.reason}`);
+		if (!again.running) return { ok: false, lines };
+	} else {
+		lines.push("daemon not running; nothing to restart");
+	}
+	return { ok: true, lines };
+}
+
+/**
+ * How the jev statusline meets an existing `statusLine`:
+ *   if-absent  install only when the user has none (default; never clobbers)
+ *   replace    theirs is swapped for ours
+ *   chain      ours prints first, theirs second — Claude Code shows both lines
+ *   skip       leave `statusLine` alone entirely
+ */
+export type StatusLineMode = "if-absent" | "replace" | "chain" | "skip";
+
+/**
+ * A command that feeds the same stdin JSON to the jev statusline and then to
+ * the user's own. POSIX sh; Claude Code runs statusline commands in a
+ * POSIX-style shell on every platform.
+ */
+export function chainedStatusLine(ours: string, theirs: string): { type: "command"; command: string } {
+	const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+	// $(…) strips trailing newlines, so each side lands on exactly one row.
+	return { type: "command", command: `j=$(cat); o=$(printf '%s' "$j" | ${ours}); t=$(printf '%s' "$j" | sh -c ${sq(theirs)}); printf '%s\\n%s\\n' "$o" "$t"` };
+}
+
 /**
  * Merge the env block into a settings.json text. Pure: returns the new text
  * and what changed. Unknown keys are preserved; only `env` and `modelOverrides`
- * entries we own are written; `model` and `statusLine` are set only when
- * absent so a user's own choices are kept.
+ * entries we own are written; `model` is set only when absent; `statusLine`
+ * follows `statusLineMode` (default: only when absent).
  */
 export function mergeClaudeSettings(
 	text: string,
 	env: Record<string, string>,
-	settingsToAdd: { modelOverrides: Record<string, string>; model: string; statusLine?: { type: "command"; command: string } },
+	settingsToAdd: { modelOverrides: Record<string, string>; model: string; statusLine?: { type: "command"; command: string }; statusLineMode?: StatusLineMode },
 ): { text: string; changed: string[]; error?: string } {
 	let settings: Record<string, unknown> = {};
 	if (text.trim()) {
@@ -329,16 +428,33 @@ export function mergeClaudeSettings(
 		settings.model = settingsToAdd.model;
 		changed.push("model");
 	}
-	if (settingsToAdd.statusLine && settings.statusLine === undefined) {
-		settings.statusLine = settingsToAdd.statusLine;
-		changed.push("statusLine");
+	const ours = settingsToAdd.statusLine;
+	const mode = settingsToAdd.statusLineMode ?? "if-absent";
+	const theirs = typeof settings.statusLine === "object" && settings.statusLine !== null ? (settings.statusLine as { type?: unknown; command?: unknown }) : undefined;
+	const alreadyOurs = theirs?.command === ours?.command;
+	if (ours && mode !== "skip" && !alreadyOurs) {
+		if (!theirs) {
+			settings.statusLine = ours;
+			changed.push("statusLine");
+		} else if (mode === "replace") {
+			settings.statusLine = ours;
+			changed.push("statusLine (replaced)");
+		} else if (mode === "chain" && theirs.type === "command" && typeof theirs.command === "string" && !theirs.command.includes(ours.command)) {
+			settings.statusLine = chainedStatusLine(ours.command, theirs.command);
+			changed.push("statusLine (chained above yours)");
+		}
 	}
 	return { text: `${JSON.stringify(settings, null, 2)}\n`, changed };
 }
 
-export function writeClaudeSettings(cfg: RouterConfig, proxyUrl: string, path: string = claudeSettingsPath()): { path: string; changed: string[]; error?: string } {
+export function writeClaudeSettings(
+	cfg: RouterConfig,
+	proxyUrl: string,
+	path: string = claudeSettingsPath(),
+	statusLineMode: StatusLineMode = "if-absent",
+): { path: string; changed: string[]; error?: string } {
 	const current = existsSync(path) ? readFileSync(path, "utf8") : "";
-	const merged = mergeClaudeSettings(current, claudeEnv(proxyUrl, cfg), { ...claudeSettings(cfg), statusLine: statusLineSetting() });
+	const merged = mergeClaudeSettings(current, claudeEnv(proxyUrl, cfg), { ...claudeSettings(cfg), statusLine: statusLineSetting(), statusLineMode });
 	if (merged.error) return { path, changed: [], error: merged.error };
 	if (merged.changed.length) {
 		mkdirSync(dirname(path), { recursive: true });

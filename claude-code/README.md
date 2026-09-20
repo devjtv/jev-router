@@ -33,10 +33,25 @@ Two pieces, sharing `~/.omp/agent/jev-router.json` with the OMP extension:
 
 ```bash
 bun add -g github:devjtv/jev-router      # or `bun link` in a clone → `jev-router` on PATH
+jev-router setup                          # guided onboarding; --yes for defaults
+```
 
+`setup` walks: detect (bun, claude, key, daemon) → OpenRouter key, verified with
+one real Jev call → a model per tier (fast / standard / deep / planner) → what
+Claude Code should believe it runs (Opus 5, 200k or 1M) → shadow mode, subagent
+policy, cache guard → writes `jev-router.json` (merge) → starts the daemon →
+optional login service → wires `settings.json` (merge, backup) → **status bar
+choice**: if you already have a `statusLine`, keep yours with the jev line
+chained above it, replace it, or leave it → two live dry runs.
+
+The same, as individual commands:
+
+```bash
 jev-router start                          # background proxy (pidfile + log in ~/.omp/agent)
-jev-router env --write                    # merge the env block into ~/.claude/settings.json, then plain `claude` works
-jev-router service install                # start at login (systemd --user / launchd / Task Scheduler)
+jev-router env --write [--statusline=if-absent|replace|chain|skip]
+                                          # merge env + modelOverrides (+ statusline) into ~/.claude/settings.json
+jev-router service install                # start at login (systemd --user / launchd / Task Scheduler → Startup folder fallback)
+jev-router update                         # pull latest (git) or re-add (bun add -g), bun install, restart the daemon
 
 jev-router claude [args]                  # one session on the gateway model; reuses the daemon or runs a private proxy
 jev-router status | stop | restart | reload | logs -f | route "<prompt>" | serve
@@ -89,7 +104,7 @@ from the terminal.
 Or let your agent do it — paste into Claude Code (or any agent with a shell):
 
 ```
-Set up the jev-router gateway model for Claude Code (https://github.com/devjtv/jev-router). Steps: (1) `bun add -g github:devjtv/jev-router` so `jev-router` is on PATH (if that fails, git clone to ~/.jev-router, `bun install`, `bun link`); (2) make sure a Jev key is available: one of OPENROUTER_API_KEY / TYPESAFE_API_KEY / JEV_API_KEY in the environment, or ~/.jev-gate/config.json, or ~/.omp/agent/.secrets/openrouter.key (mode 600) — ask me for an OpenRouter key if none exists; (3) run `jev-router start` then `jev-router status` and show me the output; (4) run `jev-router route "fix the typo in the README"` to prove the gate answers; (5) ask me whether to (a) run `jev-router env --write` so plain `claude` uses the jev-router model from now on, and (b) run `jev-router service install` so the proxy starts at login — do neither without my yes. Do not edit ~/.claude/settings.json by hand; `env --write` does it with a backup.
+Set up jev-router for Claude Code (https://github.com/devjtv/jev-router): run `bun add -g github:devjtv/jev-router` (if that fails: git clone to ~/.jev-router, `bun install`, `bun link`), then run `jev-router setup` interactively in my terminal and let me answer its prompts — it asks for an OpenRouter key if none is found, picks tier models, starts the daemon, wires ~/.claude/settings.json with a backup, and ends with a live dry run. If you cannot run it interactively, run `jev-router setup --yes` and show me its output, then `jev-router status`. Do not edit ~/.claude/settings.json or ~/.omp/agent/jev-router.json by hand.
 ```
 
 ### What happens to a request
