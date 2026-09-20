@@ -96,7 +96,35 @@ export type ClaudeCodeConfig = {
 	port: number;
 	/** Where routed requests go: the Anthropic API or another gateway. */
 	upstream: string;
-	/** tier -> model id the upstream accepts. Missing tiers derive from the tier's `anthropic/…` candidate, else `fallbackModel`. */
+	/**
+	 * Where a model spec starting with `openrouter/` goes: the API *root*, since
+	 * the request path (`/v1/messages`) is appended to it the same way it is for
+	 * the Anthropic upstream. OpenRouter serves the Anthropic Messages format, so
+	 * those requests need no translation — only the credential changes (the
+	 * OpenRouter key, never the claude.ai OAuth token).
+	 */
+	openRouterUpstream: string;
+	/**
+	 * How OpenRouter picks a provider for a model it serves from several.
+	 * `sort: "price"` is OpenRouter's own default (inverse-square price load
+	 * balancing); `"throughput"` or `"latency"` trade cost for speed and switch
+	 * load balancing off entirely.
+	 */
+	openRouter: {
+		sort: "price" | "throughput" | "latency";
+		/** Provider slugs to allow. Empty means any. */
+		only: string[];
+		/** Provider slugs to skip. */
+		ignore: string[];
+		allowFallbacks: boolean;
+		/** Restrict to zero-data-retention endpoints. */
+		zdr: boolean;
+	};
+	/**
+	 * tier -> model the upstream accepts, or `openrouter/<id>` for any of
+	 * OpenRouter's models. Missing tiers derive from the tier's `anthropic/…`
+	 * candidate, else `fallbackModel`.
+	 */
 	models: Record<string, string>;
 	/** Model when the gate is degraded, the tier is unmapped, or the request carries images under `onImages: "skip"`. */
 	fallbackModel: string;
@@ -265,6 +293,8 @@ export const DEFAULT_CONFIG: RouterConfig = {
 		model: "jev-router",
 		port: 47_131,
 		upstream: "https://api.anthropic.com",
+		openRouterUpstream: "https://openrouter.ai/api",
+		openRouter: { sort: "price", only: [], ignore: [], allowFallbacks: true, zdr: false },
 		// Overridable per tier. Anything the upstream accepts is valid here.
 		models: { fast: "claude-haiku-4-5", standard: "claude-sonnet-4-6", deep: "claude-opus-5", planner: "claude-opus-5" },
 		fallbackModel: "claude-opus-5",
@@ -327,7 +357,7 @@ export function mergeConfig(file: unknown, base: RouterConfig = DEFAULT_CONFIG):
 		...base,
 		tiers: { ...base.tiers },
 		route: { ...base.route },
-		claudeCode: { ...base.claudeCode, models: { ...base.claudeCode.models } },
+		claudeCode: { ...base.claudeCode, models: { ...base.claudeCode.models }, openRouter: { ...base.claudeCode.openRouter, only: [...base.claudeCode.openRouter.only], ignore: [...base.claudeCode.openRouter.ignore] } },
 	};
 	const src = asObject(file);
 	if (!src) return out;
@@ -410,6 +440,8 @@ export function mergeConfig(file: unknown, base: RouterConfig = DEFAULT_CONFIG):
 		if (typeof cc.model === "string" && cc.model.trim()) c.model = cc.model.trim();
 		if (typeof cc.port === "number" && Number.isInteger(cc.port) && cc.port >= 0 && cc.port <= 65_535) c.port = cc.port;
 		if (typeof cc.upstream === "string" && /^https?:\/\//.test(cc.upstream.trim())) c.upstream = cc.upstream.trim().replace(/\/+$/, "");
+		if (typeof cc.openRouterUpstream === "string" && /^https?:\/\//.test(cc.openRouterUpstream.trim()))
+			c.openRouterUpstream = cc.openRouterUpstream.trim().replace(/\/+$/, "");
 		if (typeof cc.fallbackModel === "string" && cc.fallbackModel.trim()) c.fallbackModel = cc.fallbackModel.trim();
 		if (typeof cc.effort === "boolean") c.effort = cc.effort;
 		if (typeof cc.stripThinkingOnSwitch === "boolean") c.stripThinkingOnSwitch = cc.stripThinkingOnSwitch;
@@ -421,6 +453,17 @@ export function mergeConfig(file: unknown, base: RouterConfig = DEFAULT_CONFIG):
 		// matches, silently leaving every turn unrouted.
 		if (typeof cc.behavesAs === "string" && baseModelId(cc.behavesAs)) c.behavesAs = baseModelId(cc.behavesAs);
 		if (typeof cc.maxRouteTokens === "number" && Number.isFinite(cc.maxRouteTokens) && cc.maxRouteTokens > 0) c.maxRouteTokens = cc.maxRouteTokens;
+		const or = asObject(cc.openRouter);
+		if (or) {
+			const o = c.openRouter;
+			if (or.sort === "price" || or.sort === "throughput" || or.sort === "latency") o.sort = or.sort;
+			if (typeof or.allowFallbacks === "boolean") o.allowFallbacks = or.allowFallbacks;
+			if (typeof or.zdr === "boolean") o.zdr = or.zdr;
+			for (const key of ["only", "ignore"] as const) {
+				const list = or[key];
+				if (Array.isArray(list)) o[key] = list.filter((s): s is string => typeof s === "string" && !!s.trim()).map((s) => s.trim());
+			}
+		}
 		const models = asObject(cc.models);
 		if (models) {
 			for (const [tier, id] of Object.entries(models)) {

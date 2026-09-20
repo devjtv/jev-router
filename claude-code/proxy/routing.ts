@@ -173,9 +173,11 @@ export function modelFamily(id: string): string {
 /**
  * Request features a routed model may reject; each is stripped and the request
  * retried. Body fields: `effort`, `thinking`, `context_management`. Header
- * only: `context_1m` (the `context-1m-*` beta a 200k model or plan refuses).
+ * only: `context_1m` (the `context-1m-*` beta a 200k model or plan refuses),
+ * `betas` (the whole `anthropic-beta` header, which a non-Anthropic upstream
+ * rejects wholesale), `tool_fields` (`defer_loading`/`strict` on tool schemas).
  */
-export type CompatField = "effort" | "thinking" | "context_management" | "context_1m";
+export type CompatField = "effort" | "thinking" | "context_management" | "context_1m" | "betas" | "tool_fields";
 
 /** `anthropic-beta` with the values a dropped field implies removed; undefined when nothing changes. */
 export function stripBetas(header: string | null, drop: readonly CompatField[]): string | undefined {
@@ -219,6 +221,15 @@ export function applyTarget(body: MessagesBody, target: Target): MessagesBody {
 		}
 	}
 	if (drop.has("context_management")) delete out.context_management;
+	if (drop.has("tool_fields") && Array.isArray(out.tools)) {
+		// Beta tool-schema fields (`defer_loading`, `strict`, …). The tool itself
+		// stays; only the fields a non-Anthropic upstream does not know go.
+		out.tools = (out.tools as Record<string, unknown>[]).map((t) => {
+			if (typeof t !== "object" || t === null) return t;
+			const { defer_loading: _d, eager_input_streaming: _e, strict: _s, ...rest } = t;
+			return rest;
+		});
+	}
 	if (target.stripThinking && Array.isArray(out.messages)) {
 		out.messages = (out.messages as Message[]).map((m) => {
 			if (m.role !== "assistant" || !Array.isArray(m.content)) return m;
@@ -230,15 +241,48 @@ export function applyTarget(body: MessagesBody, target: Target): MessagesBody {
 }
 
 /**
- * Detect an upstream 400 caused by a field the routed model does not accept,
+/**
+ * The `provider` object OpenRouter routes by. Only the parts that differ from
+ * OpenRouter's defaults are sent, and an empty result means "leave it alone".
+ * Any `provider` field already on the request is preserved under ours.
+ */
+export function providerPreference(prefs: {
+	sort: "price" | "throughput" | "latency";
+	only: readonly string[];
+	ignore: readonly string[];
+	allowFallbacks: boolean;
+	zdr: boolean;
+}): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	if (prefs.sort !== "price") out.sort = prefs.sort; // price is the upstream default
+	if (prefs.only.length) out.only = [...prefs.only];
+	if (prefs.ignore.length) out.ignore = [...prefs.ignore];
+	if (!prefs.allowFallbacks) out.allow_fallbacks = false;
+	if (prefs.zdr) out.zdr = true;
+	return out;
+}
+
+/**
+ * True when a response body contains a tool call written in a model's own
+ * syntax rather than Anthropic `tool_use`: Qwen's `<function=name>`, Hermes'
+ * `<tool_call>`, Mistral's `[TOOL_CALLS]`. Claude Code renders those as text
+ * instead of running them, so the turn silently does nothing.
+ */
+export function leakedToolSyntax(chunk: string): boolean {
+	return /<function=|<\/function>|<tool_call>|\[TOOL_CALLS\]|<\|tool_call\|>/.test(chunk);
+}
+
+/** Detect an upstream 400 caused by a field the routed model does not accept,
  * so the proxy can strip it and retry instead of failing the turn. Order
  * matters: a `clear_thinking` complaint mentions thinking but is about
  * context management.
  */
 export function compatProblem(status: number, errorBody: string): CompatField | undefined {
 	if (status !== 400) return undefined;
+	if (/anthropic-beta|beta header|unexpected value/i.test(errorBody)) return "betas";
 	if (/long context beta|context-1m|1m context/i.test(errorBody)) return "context_1m";
 	if (/context_management|clear_thinking|clear_tool_uses/i.test(errorBody)) return "context_management";
+	if (/defer_loading|deferred|eager_input_streaming|tool schema|input_schema|strict/i.test(errorBody)) return "tool_fields";
 	if (/output_config|effort/i.test(errorBody)) return "effort";
 	if (/thinking/i.test(errorBody)) return "thinking";
 	return undefined;

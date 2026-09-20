@@ -38,6 +38,17 @@ import {
 	type StatusLineMode,
 } from "./proxy/daemon.ts";
 import { tierModel } from "./proxy/routing.ts";
+import {
+	OR_PREFIX,
+	describeModel,
+	isOpenRouterSpec,
+	loadModels,
+	openRouterModelId,
+	openRouterVariant,
+	withVariant,
+	type OpenRouterModel,
+	type OrVariant,
+} from "./proxy/openrouter.ts";
 
 type Answers = {
 	key?: string;
@@ -55,7 +66,8 @@ const MODEL_CHOICES = [
 	{ value: "claude-sonnet-4-6", label: "Sonnet 4.6", hint: "balanced" },
 	{ value: "claude-opus-5", label: "Opus 5", hint: "strongest" },
 	{ value: "claude-fable-5-1", label: "Fable 5.1", hint: "per-message effort; cannot turn thinking off" },
-	{ value: "__custom", label: "Other…", hint: "type any model id your account accepts" },
+	{ value: "__openrouter", label: "OpenRouter model…", hint: "search 400+ models: Gemini, Qwen, DeepSeek, GPT, Llama…" },
+	{ value: "__custom", label: "Other Anthropic id…", hint: "type any model id your account accepts" },
 ];
 
 /** Merge a patch into the raw config file, keeping unknown keys and formatting the result. Pure on the text. */
@@ -96,6 +108,59 @@ export function configPatch(a: Answers): Record<string, unknown> {
 	};
 }
 
+/** Write one tier's model into `jev-router.json`, merging so nothing else moves. */
+export function setTierModel(tier: string, spec: string, path: string = configPath()): { ok: boolean; line: string } {
+	const current = existsSync(path) ? readFileSync(path, "utf8") : "";
+	const patched = patchConfigText(current, { claudeCode: { models: { [tier]: spec.trim() } } });
+	if (patched.error) return { ok: false, line: patched.error };
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, patched.text);
+	// The daemon caches config; tell it rather than leaving a stale tier behind.
+	const reloaded = `${spec.trim()}  →  ${path}`;
+	return { ok: true, line: reloaded };
+}
+
+/**
+ * Autocomplete over the OpenRouter list. Returns an `openrouter/<id>` spec, or
+ * undefined if the user backs out. Tool-capable models are labelled, since
+ * Claude Code's agentic loop cannot drive a model that does not take tools.
+ */
+export async function pickOpenRouterModel(
+	models: readonly OpenRouterModel[],
+	message: string,
+	current?: string,
+	askVariant = true,
+): Promise<string | undefined> {
+	const options = models.map((m) => ({
+		value: m.id,
+		label: `${m.tools ? "" : "! "}${m.id}`,
+		hint: describeModel(m),
+	}));
+	const picked = unwrap(
+		await p.autocomplete({
+			message,
+			placeholder: "type to search OpenRouter (e.g. gemini, qwen coder, gpt)",
+			initialValue: current && isOpenRouterSpec(current) ? openRouterModelId(current).replace(/:(nitro|floor)$/, "") : undefined,
+			maxItems: 12,
+			options,
+		}),
+	);
+	if (!picked) return undefined;
+	if (!askVariant) return `${OR_PREFIX}${picked}`;
+	const variant = unwrap(
+		await p.select<OrVariant | "default">({
+			message: `How should "${picked}" pick a provider?`,
+			initialValue: (current ? openRouterVariant(current) : undefined) ?? "default",
+			options: [
+				{ value: "default" as const, label: ":default", hint: "load-balanced by price across providers" },
+				{ value: "nitro" as const, label: ":nitro", hint: "highest throughput; priority-tier endpoints become eligible, costs more" },
+				{ value: "floor" as const, label: ":floor", hint: "cheapest provider; flex-tier endpoints become eligible, can be slower" },
+			],
+		}),
+	);
+	return `${OR_PREFIX}${withVariant(picked, variant === "default" ? undefined : variant)}`;
+}
+
 /** The user's current `statusLine.command`, if any. */
 function readStatusLine(path: string): string | undefined {
 	try {
@@ -115,15 +180,22 @@ const bail = (value: unknown): never => {
 };
 const unwrap = <T>(value: T): Exclude<T, symbol> => (p.isCancel(value) ? bail(value) : (value as Exclude<T, symbol>));
 
-async function pickModel(tier: string, current: string, yes: boolean): Promise<string> {
+async function pickModel(tier: string, current: string, yes: boolean, orModels?: readonly OpenRouterModel[]): Promise<string> {
 	if (yes) return current;
 	const choice = unwrap(
 		await p.select({
 			message: `Model for the ${tier} tier`,
-			initialValue: MODEL_CHOICES.some((c) => c.value === current) ? current : "__custom",
-			options: MODEL_CHOICES,
+			initialValue: MODEL_CHOICES.some((c) => c.value === current) || isOpenRouterSpec(current) ? current : "__custom",
+			options: isOpenRouterSpec(current) ? [{ value: current, label: `Keep ${current}` }, ...MODEL_CHOICES] : MODEL_CHOICES,
 		}),
 	);
+	if (choice === "__openrouter") {
+		if (!orModels || !orModels.length) {
+			p.log.warn("No OpenRouter model list available; skipping. Set one later with `jev-router models --tier " + tier + " --pick`.");
+			return current;
+		}
+		return (await pickOpenRouterModel(orModels, `OpenRouter model for the ${tier} tier`)) ?? current;
+	}
 	if (choice !== "__custom") return choice;
 	return unwrap(
 		await p.text({
@@ -190,7 +262,18 @@ export async function setup(opts: { yes?: boolean } = {}): Promise<void> {
 	// ---- 3. models -----------------------------------------------------------
 	if (!yes) p.log.step("Which model answers each tier. Jev picks the tier from your prompt; you pick what a tier means.");
 	const models: Record<string, string> = {};
-	for (const tier of Object.keys(cfg.tiers)) models[tier] = await pickModel(tier, tierModel(tier, cfg), yes);
+	// Fetched once, only when a picker will be shown: a fresh install with
+	// defaults should not wait on the network (or fail without it).
+	let orModels: readonly OpenRouterModel[] | undefined;
+	const wantsPicker = !yes && Object.keys(cfg.tiers).length > 0;
+	if (wantsPicker) {
+		const s = p.spinner();
+		s.start("Loading the OpenRouter model list (for the OpenRouter option)");
+		const loaded = await loadModels({ ttlMs: 24 * 60 * 60 * 1000 });
+		orModels = loaded.models;
+		s.stop(loaded.models.length ? `${loaded.models.length} models (${loaded.source})` : `unavailable: ${loaded.error ?? "no models"}`);
+	}
+	for (const tier of Object.keys(cfg.tiers)) models[tier] = await pickModel(tier, tierModel(tier, cfg), yes, orModels);
 
 	const behavesAs = yes
 		? cc.behavesAs

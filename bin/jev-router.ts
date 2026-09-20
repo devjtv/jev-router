@@ -37,15 +37,147 @@ import {
 	type Status,
 } from "../claude-code/proxy/daemon.ts";
 import { claudeEnv, claudeSettings } from "../claude-code/proxy/server.ts";
-import { setup } from "../claude-code/setup.ts";
+import { setup, modelsCommand, pickOpenRouterModel, setTierModel } from "../claude-code/setup.ts";
+import { OR_PREFIX, describeModel, describeVariant, hasOpenRouterKey, isOpenRouterSpec, loadModels, openRouterVariant, searchModels, withVariant, type OrVariant } from "../claude-code/proxy/openrouter.ts";
 import { tierModel } from "../claude-code/proxy/routing.ts";
 
-const [cmd = "help", ...rest] = process.argv.slice(2);
+/** Commands the CLI answers to; anything else in argv[0] is an argument for `claude`. */
+export const COMMANDS = [
+	"setup",
+	"serve",
+	"start",
+	"stop",
+	"restart",
+	"status",
+	"reload",
+	"service",
+	"claude",
+	"env",
+	"models",
+	"statusline",
+	"update",
+	"logs",
+	"route",
+	"help",
+	"--help",
+	"-h",
+] as const;
+
+const argv = process.argv.slice(2);
+// `jevr` (bin/jevr.ts) means "launch Claude Code", so an argument that is not a
+// command is a claude argument — `jevr -p "hi"`, not `jevr claude -p "hi"`.
+if (process.env.JEV_ROUTER_ALIAS === "1" && !(COMMANDS as readonly string[]).includes(argv[0] ?? "")) argv.unshift("claude");
+
+const [cmd = "help", ...rest] = argv;
 const flag = (name: string) => rest.includes(name);
 const opt = (name: string): string | undefined => {
 	const i = rest.indexOf(name);
 	return i >= 0 ? rest[i + 1] : undefined;
 };
+
+/**
+ * `jev-router models` — search OpenRouter, or pick a model for a tier and write
+ * it into the config as an `openrouter/<id>` spec. Interactive only when asked
+ * to pick; every other mode prints and exits so it can be piped.
+ */
+export async function modelsCommand(opts: { query?: string; tier?: string; set?: string; refresh?: boolean; pick?: boolean; variant?: OrVariant }): Promise<void> {
+	const cfg = loadConfig();
+	const cc = cfg.claudeCode;
+
+	if (!opts.query && !opts.tier && !opts.set && !opts.pick) {
+		console.log("tiers (anthropic ids go to the API directly, openrouter/<id> to OpenRouter):");
+		for (const [tier, spec] of Object.entries(cc.models)) {
+			console.log(`  ${tier.padEnd(9)} ${spec}${isOpenRouterSpec(spec) ? `  ← via ${cc.openRouterUpstream}` : ""}`);
+		}
+		console.log(`  ${"fallback".padEnd(9)} ${cc.fallbackModel}`);
+		console.log(`\nkey: ${hasOpenRouterKey() ? "OpenRouter key present" : "no OpenRouter key (OPENROUTER_API_KEY or `jev-router key <key>`)"}`);
+		console.log(`\nsearch:   jev-router models gemini`);
+		console.log(`pick:     jev-router models --tier deep --pick`);
+		console.log(`set:      jev-router models --tier deep --set openrouter/anthropic/claude-sonnet-4.5`);
+		return;
+	}
+
+	const loading = opts.query || opts.pick || opts.tier ? new Date(Date.now() + 0).getTime() : 0;
+	void loading;
+	const { models, source, fetchedAt, error } = await loadModels({ refresh: opts.refresh });
+	if (error) console.error(`(model list: ${source}${fetchedAt ? ` from ${fetchedAt}` : ""} — ${error})`);
+	if (!models.length) {
+		console.error("no model list available: check your network, or retry with --refresh");
+		process.exit(1);
+	}
+
+	if (opts.set) {
+		const tier = opts.tier ?? "standard";
+		if (!cfg.tiers[tier]) {
+			console.error(`unknown tier "${tier}" — configured: ${Object.keys(cfg.tiers).join(", ")}`);
+			process.exit(1);
+		}
+		const spec = isOpenRouterSpec(opts.set) ? withVariant(opts.set, opts.variant) : opts.set;
+		const r = setTierModel(tier, spec);
+		if (!r.ok) {
+			console.error(r.line);
+			process.exit(1);
+		}
+		console.log(`${tier} → ${spec}`);
+		console.log(`  ${r.line.split("  →  ")[1]}`);
+		if (isOpenRouterSpec(spec)) console.log(`  ${describeVariant(openRouterVariant(spec))}`);
+		await reloadDaemon();
+		return;
+	}
+
+	if (opts.pick || (opts.tier && !opts.query)) {
+		const tier = opts.tier ?? "standard";
+		if (!cfg.tiers[tier]) {
+			console.error(`unknown tier "${tier}" — configured: ${Object.keys(cfg.tiers).join(", ")}`);
+			process.exit(1);
+		}
+		if (!process.stdin.isTTY) {
+			console.error("--pick needs a terminal; use --set openrouter/<id> instead");
+			process.exit(2);
+		}
+		const chosen = await pickOpenRouterModel(models, `Model for the ${tier} tier`, cc.models[tier]);
+		if (!chosen) {
+			console.log("no change");
+			return;
+		}
+		const r = setTierModel(tier, chosen);
+		if (!r.ok) {
+			console.error(r.line);
+			process.exit(1);
+		}
+		console.log(`${tier} → ${chosen}`);
+		console.log(`  ${describeVariant(openRouterVariant(chosen))}`);
+		await reloadDaemon();
+		return;
+	}
+
+	const matches = searchModels(models, opts.query ?? "", 30);
+	if (!matches.length) {
+		console.error(`nothing matched "${opts.query}" among ${models.length} models`);
+		process.exit(1);
+	}
+	for (const m of matches) {
+		const spec = `${OR_PREFIX}${m.id}`;
+		console.log(`${m.tools ? " " : "!"} ${spec.padEnd(48)} ${describeModel(m)}`);
+	}
+	console.log(`\n! = the model does not declare tool support; Claude Code needs tools.`);
+	console.log(`Any spec takes a provider variant:  ${OR_PREFIX}${matches[0]!.id}:nitro   (or :floor)`);
+	console.log(`  ${describeVariant("nitro")}`);
+	console.log(`  ${describeVariant("floor")}`);
+	console.log(`set one with:  jev-router models --tier <tier> --set <spec> [--variant nitro|floor]`);
+}
+
+/** Tell a running daemon to re-read the config it just had rewritten under it. */
+async function reloadDaemon(): Promise<void> {
+	const s = await status();
+	if (!s.running) return;
+	try {
+		await fetch(`${s.url}/jev-router/reload`, { method: "POST" });
+		console.log("  daemon reloaded");
+	} catch {
+		console.log("  daemon did not answer; it will pick the change up on restart");
+	}
+}
 
 function fmtStatus(s: Status): string {
 	if (!s.running) return `not running — ${s.reason}`;
@@ -168,6 +300,18 @@ switch (cmd) {
 		}
 		break;
 	}
+	case "models": {
+		const variant = opt("--variant");
+		await modelsCommand({
+			query: rest.filter((a) => !a.startsWith("-")).join(" ").trim(),
+			tier: opt("--tier"),
+			set: opt("--set"),
+			refresh: flag("--refresh"),
+			pick: flag("--pick"),
+			...(variant === "nitro" || variant === "floor" ? { variant } : {}),
+		});
+		break;
+	}
 	case "statusline": {
 		await statusLineCommand();
 		break;
@@ -219,6 +363,10 @@ switch (cmd) {
 				"                              env block for Claude Code; --write merges into settings.json",
 				"  update                      pull the latest jev-router, reinstall deps, restart the daemon",
 				"  logs [-n N] [-f]            routing log",
+				"  models [query]              search OpenRouter's models (400+, tool-capable marked)",
+				"  models --tier <t> --pick    choose a model + provider variant (:nitro / :floor) for a tier",
+				"  models --tier <t> --set <spec> [--variant nitro|floor]",
+				"                              set a tier's model non-interactively",
 				"  statusline                  Claude Code statusLine command: shows this session's route",
 				"  route <text>                dry-run the gate",
 				"",

@@ -63,6 +63,39 @@ overrides which `claude` runs (a real executable is preferred over a `.cmd`
 shim on Windows; an npm-left `claude.cmd` on this machine is 160 zero bytes and
 exits silently).
 
+### Any OpenRouter model, per tier
+
+```bash
+jevr models                       # tiers, and whether an OpenRouter key is set
+jevr models gemini                # search ~450 models ("qwen coder" works too)
+jevr models --tier fast --pick     # autocomplete → model → provider variant
+jevr models --tier fast --set openrouter/qwen/qwen3-coder-flash --variant nitro
+```
+
+`jevr` is the short form of `jev-router` (bare `jevr` launches Claude Code).
+Specs are `openrouter/<their id>`, plus OpenRouter's provider variants as
+suffixes: `:nitro` (throughput, priority tier) or `:floor` (cheapest, flex
+tier). OpenRouter serves the Anthropic Messages format, so nothing is
+translated; the proxy swaps in the OpenRouter key and never sends the claude.ai
+token there. Anthropic-direct tiers keep using your subscription, so a single
+config can mix both.
+
+`provider.sort`/`only`/`ignore`/`allow_fallbacks`/`zdr` live under
+`claudeCode.openRouter`; a `:nitro`/`:floor` suffix already implies the sort,
+so it is not stacked.
+
+**Measured, not assumed:** Gemini 2.5 Flash `:nitro` drove a full Claude Code
+turn — the model called `Read`, Claude Code executed it, the answer was right.
+A `tool_format_suspect` line appears (log + daemon log, once per model) if an
+upstream returns 200 with a tool call written as *text* instead of `tool_use`,
+which Claude Code would show rather than run: measured once with Qwen3 Coder
+Flash through the provider that served it, while a minimal probe of six models
+(Claude Haiku, Gemini Flash, GPT-4.1-mini, DeepSeek, Qwen3 Coder ±flash)
+returned proper `tool_use` — so the variance is per provider as much as per
+model. Deferred tools (`defer_loading`) are an Anthropic-only capability and
+are stripped up front for non-Anthropic models, which OpenRouter rejects them
+for.
+
 ### Daemon details
 
 - The **server writes the pidfile** (`~/.omp/agent/jev-router.pid`) with its

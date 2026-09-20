@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Oh My Pi extension: pick the model and thinking effort for each prompt with TypeSafe Jev.",
   "bin": {
-    "jev-router": "./bin/jev-router.ts"
+    "jev-router": "./bin/jev-router.ts",
+    "jevr": "./bin/jevr.ts"
   },
   "omp": {
     "extensions": ["./extensions/jev-router.ts"]

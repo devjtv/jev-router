@@ -16,7 +16,9 @@ import {
 	applyTarget,
 	classifyTurn,
 	compatProblem,
+	leakedToolSyntax,
 	modelFamily,
+	providerPreference,
 	promptText,
 	tierModel,
 	turnFingerprint,
@@ -25,6 +27,13 @@ import {
 	usageTokens,
 } from "../claude-code/proxy/routing.ts";
 import { claudeEnv, claudeSettings, createProxy } from "../claude-code/proxy/server.ts";
+import {
+	isOpenRouterSpec,
+	openRouterModelId,
+	openRouterVariant,
+	searchModels,
+	withVariant,
+} from "../claude-code/proxy/openrouter.ts";
 
 // ----------------------------------------------------------------------------
 // Fixtures
@@ -228,6 +237,45 @@ describe("claudeCode config", () => {
 		expect(setupSource).not.toMatch(/value: "claude-[a-z0-9.-]*\[/);
 	});
 
+	test("OpenRouter specs: prefix, model id, and :nitro/:floor variants", () => {
+		expect(isOpenRouterSpec("openrouter/qwen/qwen3-coder")).toBe(true);
+		expect(isOpenRouterSpec("claude-opus-5")).toBe(false);
+		expect(openRouterModelId("openrouter/anthropic/claude-sonnet-4.5")).toBe("anthropic/claude-sonnet-4.5");
+		expect(openRouterVariant("qwen/qwen3-coder-flash:nitro")).toBe("nitro");
+		expect(openRouterVariant("qwen/qwen3-coder-flash:floor")).toBe("floor");
+		expect(openRouterVariant("qwen/qwen3-coder-flash")).toBeUndefined();
+		expect(openRouterVariant("qwen/qwen3-coder-flash:free")).toBeUndefined(); // not one of ours to strip
+		expect(withVariant("qwen/qwen3-coder-flash", "nitro")).toBe("qwen/qwen3-coder-flash:nitro");
+		expect(withVariant("qwen/qwen3-coder-flash:floor", "nitro")).toBe("qwen/qwen3-coder-flash:nitro"); // swaps, never stacks
+		expect(withVariant("qwen/qwen3-coder-flash:nitro", undefined)).toBe("qwen/qwen3-coder-flash");
+	});
+
+	test("provider preferences are sent only when they differ from OpenRouter's defaults", () => {
+		const base = { sort: "price" as const, only: [], ignore: [], allowFallbacks: true, zdr: false };
+		expect(providerPreference(base)).toEqual({});
+		expect(providerPreference({ ...base, sort: "throughput" })).toEqual({ sort: "throughput" });
+		expect(providerPreference({ ...base, only: ["deepinfra"], ignore: ["openai"], allowFallbacks: false, zdr: true })).toEqual({
+			only: ["deepinfra"],
+			ignore: ["openai"],
+			allow_fallbacks: false,
+			zdr: true,
+		});
+	});
+
+	test("search ranks tool-capable models first and matches multi-word queries", () => {
+		const models = [
+			{ id: "qwen/qwen3-coder", name: "Qwen3 Coder", tools: true, images: false },
+			{ id: "qwen/qwen-chat", name: "Qwen Chat", tools: false, images: false },
+			{ id: "google/gemini-2.5-pro", name: "Gemini 2.5 Pro", tools: true, images: true },
+		];
+		expect(searchModels(models, "qwen coder").map((m) => m.id)).toEqual(["qwen/qwen3-coder"]);
+		// Same relevance, tools-capable wins.
+		expect(searchModels(models, "qwen").map((m) => m.id)).toEqual(["qwen/qwen3-coder", "qwen/qwen-chat"]);
+		expect(searchModels(models, "GEMINI")[0]!.id).toBe("google/gemini-2.5-pro"); // case-insensitive
+		expect(searchModels(models, "nothing-like-this")).toEqual([]);
+		expect(searchModels(models, "", 2)).toHaveLength(2);
+	});
+
 	test("stripBetas removes only the 1M beta, only when asked", () => {
 		const header = "claude-code-20250219,context-1m-2025-08-07,effort-2025-11-24";
 		expect(stripBetas(header, ["context_1m"])).toBe("claude-code-20250219,effort-2025-11-24");
@@ -311,14 +359,15 @@ const nextUsage = (): Promise<number> => {
 	usageSeen = { resolve, promise };
 	return promise;
 };
-const makeProxy = (over: Partial<RouterConfig> = {}, ccOver: Partial<RouterConfig["claudeCode"]> = {}) =>
+const makeProxy = (over: Partial<RouterConfig> = {}, ccOver: Partial<RouterConfig["claudeCode"]> = {}, opts: Partial<Parameters<typeof createProxy>[0]> = {}) =>
 	createProxy({
-		cfg: { ...cfg, ...over, log: true, claudeCode: { ...cfg.claudeCode, ...ccOver } },
+		cfg: { ...cfg, ...over, log: true, claudeCode: { ...cfg.claudeCode, openRouterUpstream: `http://127.0.0.1:${upstream.port}`, ...ccOver } },
 		port: 0,
 		upstream: `http://127.0.0.1:${upstream.port}`,
 		decide,
 		log: (line) => logs.push(line),
 		onUsage: (_state, tokens) => usageSeen?.resolve(tokens),
+		...opts,
 	});
 
 const post = (url: string, payload: unknown, headers: Record<string, string> = {}, path = "/v1/messages?beta=true") =>
@@ -375,6 +424,14 @@ describe("gateway model", () => {
 		expect(after.aliasSeen).toBe(true);
 	});
 
+	test("leakedToolSyntax spots a tool call written in a model's own format", () => {
+		expect(leakedToolSyntax('</function>\n<parameter=file_path>a</parameter>')).toBe(true);
+		expect(leakedToolSyntax("<function=Write>")).toBe(true);
+		expect(leakedToolSyntax('{"type":"tool_use","id":"x","name":"Read"}')).toBe(false);
+		expect(leakedToolSyntax('the word function= appears in prose')).toBe(false);
+		expect(leakedToolSyntax("<tool_call>{\"name\":\"Read\"}</tool_call>")).toBe(true);
+	});
+
 	test("a wire name carrying a modifier still routes (jev-router[1m])", async () => {
 		const proxy = makeProxy();
 		proxies.push(proxy);
@@ -385,6 +442,54 @@ describe("gateway model", () => {
 		// Rewritten onto the tier's model, so the modifier never reaches upstream.
 		expect(seen[0]!.body.model).toBe("claude-haiku-4-5");
 		expect(proxy.sessions.get("sess-1")?.tier).toBe("fast");
+	});
+
+	test("an openrouter/ tier goes to the OpenRouter upstream with its key, not the OAuth token", async () => {
+		const proxy = makeProxy({}, { models: { fast: "openrouter/qwen/qwen3-coder-flash:nitro", standard: "claude-sonnet-4-6", deep: "claude-opus-5", planner: "claude-opus-5" } }, { openRouterKey: "sk-or-v1-test" });
+		proxies.push(proxy);
+		decisions.a = "fast";
+		const res = await post(proxy.url, body([user("a")]));
+		expect(res.status).toBe(200);
+		// Routed, rewritten to the bare OpenRouter id with its variant intact.
+		expect(seen[0]!.body.model).toBe("qwen/qwen3-coder-flash:nitro");
+		// The claude.ai token must not travel to OpenRouter.
+		expect(seen[0]!.headers.authorization).toBe("Bearer sk-or-v1-test");
+		expect(JSON.stringify(seen[0]!.headers)).not.toContain("sk-test");
+		// The variant implies the sort, so no explicit provider.sort is stacked on it.
+		expect(seen[0]!.body.provider).toBeUndefined();
+		// The tier is pinned to the spec, so the next turn stays there.
+		expect(proxy.sessions.get("sess-1")?.model).toBe("openrouter/qwen/qwen3-coder-flash:nitro");
+	});
+
+	test("provider preferences ride along for openrouter tiers without a variant, and only for them", async () => {
+		const proxy = makeProxy(
+			{},
+			{
+				openRouter: { sort: "throughput", only: ["deepinfra"], ignore: [], allowFallbacks: false, zdr: true },
+				models: { fast: "openrouter/qwen/qwen3-coder-flash", standard: "claude-sonnet-4-6", deep: "claude-opus-5", planner: "claude-opus-5" },
+			},
+			{ openRouterKey: "sk-or-v1-test" },
+		);
+		proxies.push(proxy);
+		decisions.a = "fast";
+		await post(proxy.url, body([user("a")]));
+		expect(seen[0]!.body.provider).toEqual({ sort: "throughput", only: ["deepinfra"], allow_fallbacks: false, zdr: true });
+		// Anthropic-direct requests never see a provider field.
+		seen.length = 0;
+		gateCalls = 0;
+		await post(proxy.url, body([user("b")], { model: "claude-sonnet-4-6" }));
+		expect(seen[0]!.body.provider).toBeUndefined();
+	});
+
+	test("an openrouter tier with no key says so instead of sending the turn nowhere", async () => {
+		const proxy = makeProxy({}, { models: { fast: "openrouter/qwen/qwen3-coder-flash", standard: "claude-sonnet-4-6", deep: "claude-opus-5", planner: "claude-opus-5" } }, { openRouterKey: null });
+		proxies.push(proxy);
+		decisions.a = "fast";
+		const res = await post(proxy.url, body([user("a")]));
+		expect(res.status).toBe(401);
+		const payload = (await res.json()) as { error: { message: string } };
+		expect(payload.error.message).toContain("OpenRouter key");
+		expect(seen).toHaveLength(0); // nothing was forwarded anywhere
 	});
 
 	test("requests for other models pass through byte-for-byte, headers included", async () => {

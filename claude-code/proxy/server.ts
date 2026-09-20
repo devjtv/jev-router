@@ -39,13 +39,16 @@ import {
 	type Decision,
 	type RouterConfig,
 } from "../../extensions/jev-router.ts";
+import { hasOpenRouterKey, isOpenRouterSpec, openRouterKey, openRouterModelId, openRouterVariant } from "./openrouter.ts";
 import {
 	applyTarget,
 	classifyTurn,
 	compatProblem,
 	estimateTokens,
 	hasImages,
+	leakedToolSyntax,
 	modelFamily,
+	providerPreference,
 	promptText,
 	sessionKey,
 	stripBetas,
@@ -77,6 +80,11 @@ export type ProxyOptions = {
 	upstream?: string;
 	/** Test seam: replaces the Jev call. */
 	decide?: (prompt: string, cfg: RouterConfig, signal: AbortSignal) => Promise<Decision>;
+	/**
+	 * Test seam for the OpenRouter credential: a string to use, `null` to act as
+	 * if none is configured. Omit to read the environment / secrets file.
+	 */
+	openRouterKey?: string | null;
 	fetchImpl?: typeof fetch;
 	/** Receives every log line the proxy would write; defaults to the shared JSONL log. */
 	log?: (line: Record<string, unknown>) => void;
@@ -143,6 +151,12 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 	const log = opts.log ?? ((line) => appendLog(line));
 	const trace = opts.trace ?? (() => {});
 	const rng = opts.rng ?? Math.random;
+	/** The OpenRouter credential, resolved once; `null` in options means "pretend there is none". */
+	const orKey = opts.openRouterKey === undefined ? openRouterKey() : (opts.openRouterKey ?? undefined);
+	/** Models whose upstream credential was already reported missing. */
+	const missingKeyWarned = new Set<string>();
+	/** Models already reported as returning tool calls in their own format. */
+	const suspectWarned = new Set<string>();
 	const sessions = new Map<string, SessionState>();
 	/** Fields a given upstream model has rejected with a 400, so later requests pre-strip them. */
 	const quirks = new Map<string, Set<CompatField>>();
@@ -285,7 +299,7 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 				decision: decision ? (decision.kind === "tier" ? decision.tier : decision.action) : undefined,
 				why: decision?.why,
 				tier,
-				model: `anthropic/${model}`,
+				model: isOpenRouterSpec(model) ? model : `anthropic/${model}`,
 				effort,
 				switched: switched && !cfg.shadow,
 				shadowed: cfg.shadow && switched,
@@ -301,17 +315,74 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 		return next;
 	}
 
+	/**
+	 * Where a target's request goes, and with whose credential.
+	 *
+	 * Anthropic-direct forwards Claude Code's headers untouched, including the
+	 * claude.ai OAuth token. An `openrouter/` target must not: that token is for
+	 * Anthropic, and OpenRouter bills the OpenRouter key — so the auth headers are
+	 * replaced, never passed along.
+	 */
+	function upstreamFor(spec: string): { base: string; model: string; authorization?: string; missingKey?: string } {
+		if (!isOpenRouterSpec(spec)) return { base: upstream, model: spec };
+		return {
+			base: cc.openRouterUpstream,
+			model: openRouterModelId(spec),
+			...(orKey ? { authorization: `Bearer ${orKey}` } : { missingKey: `no OpenRouter key (set OPENROUTER_API_KEY or run \`jev-router key <key>\`) — ${spec} cannot be called` }),
+		};
+	}
+
 	/** Forward a rewritten Messages request, stripping fields the model rejects and retrying once per field. */
 	async function forwardMessages(req: Request, url: URL, body: MessagesBody, target: Target, state: SessionState | undefined): Promise<Response> {
-		const MAX_RETRIES = 4; // one per CompatField
+		const MAX_RETRIES = 5; // one per CompatField
+		const dest = upstreamFor(target.model);
+		// Deferred tools (`defer_loading`, the tool-search beta) are an Anthropic
+		// capability: OpenRouter rejects them for any other model with a 400. That
+		// is predictable from the model id, so it is stripped up front rather than
+		// learned by failing a turn.
+		const impliedDrop: CompatField[] = dest.authorization && !/^anthropic\//.test(dest.model) ? ["tool_fields"] : [];
+		if (dest.missingKey) {
+			// Claude Code retries a failed turn several times; one line per model
+			// per process is the signal, the repetition is noise.
+			if (!missingKeyWarned.has(target.model)) {
+				missingKeyWarned.add(target.model);
+				if (cfg.log) log({ event: "route_error", model: target.model, error: dest.missingKey });
+				trace(dest.missingKey);
+			}
+			return Response.json(
+				{ type: "error", error: { type: "authentication_error", message: `jev-router: ${dest.missingKey}` } },
+				{ status: 401 },
+			);
+		}
 		for (let attempt = 0; ; attempt++) {
 			const known = quirks.get(target.model);
-			const drop = [...(target.drop ?? []), ...(known ?? [])];
-			const shaped = applyTarget(body, { ...target, drop });
+			const drop = [...impliedDrop, ...(target.drop ?? []), ...(known ?? [])];
+			const shaped = applyTarget(body, { ...target, model: dest.model, drop });
+			if (dest.authorization) {
+				// OpenRouter only: provider routing preferences. A `:nitro`/`:floor`
+				// suffix already implies a sort (and service-tier eligibility), so an
+				// explicit sort is not stacked on top of it.
+				const variant = openRouterVariant(dest.model);
+				const prefs = providerPreference(cc.openRouter);
+				if (variant) delete prefs.sort;
+				if (Object.keys(prefs).length) {
+					const existing = typeof shaped.provider === "object" && shaped.provider !== null ? (shaped.provider as Record<string, unknown>) : {};
+					shaped.provider = { ...prefs, ...existing };
+				}
+			}
 			const headers = forwardHeaders(req.headers);
-			const betas = stripBetas(headers.get("anthropic-beta"), drop);
-			if (betas !== undefined) headers.set("anthropic-beta", betas);
-			const res = await fetchImpl(`${upstream}${url.pathname}${url.search}`, { method: "POST", headers, body: JSON.stringify(shaped) });
+			if (dest.authorization) {
+				headers.delete("authorization");
+				headers.delete("x-api-key");
+				headers.set("authorization", dest.authorization);
+				headers.set("x-title", "jev-router");
+			}
+			if (drop.includes("betas")) headers.delete("anthropic-beta");
+			else {
+				const betas = stripBetas(headers.get("anthropic-beta"), drop);
+				if (betas !== undefined) headers.set("anthropic-beta", betas);
+			}
+			const res = await fetchImpl(`${dest.base}${url.pathname}${url.search}`, { method: "POST", headers, body: JSON.stringify(shaped) });
 			if (res.status === 400 && attempt < MAX_RETRIES) {
 				const text = await res.clone().text();
 				const problem = compatProblem(res.status, text);
@@ -328,7 +399,16 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 		}
 	}
 
-	/** Stream the upstream response back, reading `usage` off it for the cache guard. */
+	/**
+	 * Stream the upstream response back, reading `usage` off it for the cache
+	 * guard — and watching for a tool call that arrived as *text*.
+	 *
+	 * Some upstream/provider combinations return 200 with the model's own tool
+	 * syntax (Qwen's `<function=…>`, for instance) instead of Anthropic
+	 * `tool_use` blocks. Claude Code then shows the call to the user instead of
+	 * running it: the turn "works" and does nothing. Nothing can be fixed
+	 * automatically, so it is recorded once per model.
+	 */
 	function relay(res: Response, state: SessionState | undefined): Response {
 		const headers = responseHeaders(res.headers);
 		if (!res.body || !state) return new Response(res.body, { status: res.status, headers });
@@ -339,21 +419,33 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 				const reader = watch.getReader();
 				const decoder = new TextDecoder();
 				let buffer = "";
-				let found = false;
+				let found: "usage" | "cap" | undefined;
+				let checked = false;
 				try {
 					for (;;) {
 						const { done, value } = await reader.read();
 						if (done) break;
-						if (found) continue; // keep draining so the tee never backs up
 						buffer += decoder.decode(value, { stream: true });
+						if (!checked && (leakedToolSyntax(buffer) || buffer.length > 65_536)) {
+							checked = true; // no tool call yet, or too late to tell
+							if (leakedToolSyntax(buffer)) {
+								if (!suspectWarned.has(state.model)) {
+									suspectWarned.add(state.model);
+									const message = `${state.model} returned a tool call as text (its own format, not tool_use) — Claude Code will show it instead of running it. Pick another model/provider for this tier (try \`:nitro\`, or \`jev-router models --tier <tier> --pick\`).`;
+									if (cfg.log) log({ event: "tool_format_suspect", model: state.model, message });
+									trace(message);
+								}
+							}
+						}
+						if (found) continue; // keep draining so the tee never backs up
 						const tokens = usageFromSse(buffer);
 						if (tokens !== undefined) {
 							state.contextTokens = tokens;
 							opts.onUsage?.(state, tokens);
-							found = true;
+							found = "usage";
 							buffer = "";
 						} else if (buffer.length > 65_536) {
-							found = true; // give up looking, stop buffering
+							found = "cap"; // give up looking, stop buffering
 							buffer = "";
 						}
 					}
@@ -403,6 +495,11 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 				tiers: Object.fromEntries(Object.keys(cfg.tiers).map((t) => [t, tierModel(t, cfg)])),
 				fallbackModel: cc.fallbackModel,
 				selectModel: baseModelId(cc.behavesAs),
+				openRouter: {
+					upstream: cc.openRouterUpstream,
+					key: orKey !== undefined,
+					tiers: Object.fromEntries(Object.entries(cfg.claudeCode.models).filter(([, spec]) => isOpenRouterSpec(spec))),
+				},
 				requestsSeen,
 				aliasSeen,
 				sessions: Object.fromEntries(sessions),
@@ -468,13 +565,20 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 		let state = sessions.get(key);
 
 		if (url.pathname === "/v1/messages/count_tokens") {
-			const model = state?.model ?? cc.fallbackModel;
-			const res = await fetchImpl(`${upstream}${url.pathname}${url.search}`, {
+			const spec = state?.model ?? cc.fallbackModel;
+			const dest = upstreamFor(spec);
+			const headers = forwardHeaders(req.headers);
+			if (dest.authorization) {
+				headers.delete("authorization");
+				headers.delete("x-api-key");
+				headers.set("authorization", dest.authorization);
+			}
+			const res = await fetchImpl(`${dest.base}${url.pathname}${url.search}`, {
 				method: "POST",
-				headers: forwardHeaders(req.headers),
-				body: JSON.stringify({ ...body, model }),
+				headers,
+				body: JSON.stringify({ ...body, model: dest.model }),
 			});
-			if (debug) log({ event: "count_tokens", host: "claude-code", model, status: res.status, body: res.ok ? undefined : (await res.clone().text()).slice(0, 300) });
+			if (debug) log({ event: "count_tokens", host: "claude-code", model: dest.model, status: res.status, body: res.ok ? undefined : (await res.clone().text()).slice(0, 300) });
 			return new Response(res.body, { status: res.status, headers: responseHeaders(res.headers) });
 		}
 

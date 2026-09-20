@@ -297,14 +297,57 @@ installs a `statusLine` (only if you have none) that renders
 session goes; `jev-router logs -f` follows the full JSONL; `jev-router status`
 lists every live session's pin.
 
+### OpenRouter models per tier
+
+A tier is not limited to Claude models. Any tier can route through OpenRouter —
+across their ~450 models — and Claude Code's requests need no translation,
+because OpenRouter serves the Anthropic Messages format:
+
+```bash
+jev-router models                      # current tier → spec, and whether a key is set
+jev-router models gemini               # search the list (multi-word works: "qwen coder")
+jev-router models --tier deep --pick    # autocomplete picker → model, then provider variant
+jev-router models --tier fast --set openrouter/google/gemini-2.5-flash --variant nitro
+```
+
+A spec is `openrouter/<their id>`, optionally with a **provider variant**:
+
+| variant | what it does |
+| --- | --- |
+| *(none)* | load-balanced by price across providers (OpenRouter's default) |
+| `:nitro` | sort by throughput, priority-tier endpoints eligible — fastest, costs more |
+| `:floor` | sort by price, flex-tier endpoints eligible — cheapest, can be slower |
+
+`:nitro`/`:floor` are OpenRouter's own suffixes, so they compose with everything
+else here. For the rest of their routing controls (`only`, `ignore`,
+`allow_fallbacks`, `zdr`) set `claudeCode.openRouter` in the config.
+
+**Credential**: `OPENROUTER_API_KEY`, or the key `jev-router key <key>` saves
+(`~/.omp/agent/.secrets/openrouter.key`). The claude.ai OAuth token is *never*
+forwarded to OpenRouter — Anthropic-direct tiers keep using your subscription,
+OpenRouter tiers bill the OpenRouter key, and the two can be mixed per tier.
+
+**Tool fidelity varies by model *and* provider.** Claude Code's loop is tool
+calls; if an upstream returns 200 with the model's native tool syntax as text
+instead of `tool_use`, Claude Code shows the call rather than running it. The
+proxy cannot repair that, so it records it: `tool_format_suspect` in the log and
+a line in the daemon log, once per model. Measured live: Gemini 2.5 Flash drove
+a full Read-tool turn correctly; Qwen3 Coder Flash leaked XML in one turn
+through the provider that served it. If a tier misbehaves, try `:nitro`, a
+different model, or `--pick` another.
+
 ### CLI and background service
 
 Two commands from nothing to routing:
 
 ```bash
-bun add -g github:devjtv/jev-router      # or, in a clone: bun link  → `jev-router` on PATH
+bun add -g github:devjtv/jev-router      # or, in a clone: bun link → `jev-router` and `jevr` on PATH
 jev-router setup                          # guided: key (verified live) → tier models → preferences → daemon → Claude Code wiring → dry run
 ```
+
+`jevr` is the short form: bare `jevr` launches Claude Code on the gateway model,
+`jevr -p "fix the typo"` passes arguments through, `jevr status` behaves like any
+other command. Or roll your own: `alias jr='jev-router claude'`.
 
 `setup` detects what you already have, asks only what it cannot infer, merges
 into existing files instead of overwriting them, and ends with two real gate
@@ -366,7 +409,9 @@ Configuration lives under `claudeCode` in the same `jev-router.json`:
   "model": "jev-router",                 // the picker entry and wire name
   "port": 47131,
   "upstream": "https://api.anthropic.com",
-  "models": { "fast": "claude-haiku-4-5", "standard": "claude-sonnet-4-6", "deep": "claude-opus-5", "planner": "claude-opus-5" },
+  "models": { "fast": "openrouter/google/gemini-2.5-flash:nitro", "standard": "claude-sonnet-4-6", "deep": "claude-opus-5", "planner": "claude-opus-5" },
+  "openRouterUpstream": "https://openrouter.ai/api",   // API root; /v1/messages is appended
+  "openRouter": { "sort": "price", "only": [], "ignore": [], "allowFallbacks": true, "zdr": false },
   "fallbackModel": "claude-opus-5",      // gate down, image turn under onImages: "skip", proxy restarted mid-turn
   "effort": true,                        // apply the candidate's effort as output_config.effort
   "stripThinkingOnSwitch": true,         // drop prior thinking blocks when the model changes between turns
@@ -433,7 +478,10 @@ test/claude-code-proxy.test.ts the gateway model against a stub upstream: pinnin
 claude-code/proxy/routing.ts   pure request shaping: turn detection, prompt text, tier -> model, field stripping
 claude-code/proxy/server.ts    the gateway model (Bun.serve): per-turn routing, streaming relay, usage tracking
 claude-code/proxy/daemon.ts    pidfile lifecycle, detached start/stop, service adapters, settings.json merge, claude launch
-bin/jev-router.ts              the CLI: serve/start/stop/status/reload/service/claude/env/logs/route
+claude-code/proxy/openrouter.ts OpenRouter model list (cached), search, :nitro/:floor variants, the key
+claude-code/setup.ts           the onboarding flow and the config/tier patch helpers
+bin/jev-router.ts              the CLI: setup/models/serve/start/stop/status/reload/service/claude/env/logs/route
+bin/jevr.ts                    the short alias — defaults to `claude`
 claude-code/launch.ts          thin wrapper ≡ `jev-router claude`
 claude-code/hooks/             the PreModelSwitch cache-guard plugin
 test/cli.test.ts               pidfile, settings merge, service definitions, a real detached start→stop cycle
