@@ -385,6 +385,18 @@ jev-router setup                          # guided: key (verified live) → tier
 `jevr -p "fix the typo"` passes arguments through, `jevr status` behaves like any
 other command. Or roll your own: `alias jr='jev-router claude'`.
 
+**Under WSL:** the shims are Windows executables, so WSL resolves them only as
+`jevr.exe` — bare `jevr` is "command not found". Either bridge it:
+
+```sh
+printf '#!/bin/sh\nexec /mnt/c/Users/<you>/.bun/bin/jevr.exe "$@"\n' > ~/.local/bin/jevr && chmod +x ~/.local/bin/jevr
+```
+
+…which keeps the CLI **and its daemon** on the Windows side (so `jevr` launches
+the Windows Claude Code), or install natively inside WSL — that needs Bun
+(`curl -fsSL https://bun.sh/install | bash`) and is the right choice if `claude`
+in your WSL shell is the WSL build.
+
 `setup` detects what you already have, asks only what it cannot infer, merges
 into existing files instead of overwriting them, and ends with two real gate
 answers so you see a route before trusting it. `--yes` takes every default

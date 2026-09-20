@@ -75,6 +75,20 @@ describe("settings.json merge", () => {
 	});
 });
 
+describe("CLI dispatch", () => {
+	test("every command the switch handles is in COMMANDS, so the `jevr` alias never swallows one", () => {
+		const src = readFileSync(join(import.meta.dir, "..", "bin", "jev-router.ts"), "utf8");
+		// `jevr key` used to launch Claude Code because "key" was a real case but
+		// missing from COMMANDS: the alias saw an unknown first argument and
+		// treated it as claude args. Keep the two lists equal.
+		const cases = [...src.matchAll(/^\tcase "([a-z-]+)":/gm)].map((m) => m[1]!);
+		const listed = [...src.matchAll(/^\t"(--?[a-z-]+|[a-z-]+)",$/gm)].map((m) => m[1]!);
+		const commands = listed.filter((c) => cases.includes(c) || c.startsWith("-") || c === "help");
+		expect(cases.length).toBeGreaterThan(10);
+		for (const c of cases) expect(commands).toContain(c);
+	});
+});
+
 describe("status line", () => {
 	const input = { session_id: "s1", model: { id: "claude-opus-5", display_name: "Opus 5" }, context_window: { used_percentage: 20.4 } };
 

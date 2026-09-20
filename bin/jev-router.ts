@@ -55,6 +55,7 @@ export const COMMANDS = [
 	"service",
 	"claude",
 	"env",
+	"key",
 	"models",
 	"statusline",
 	"update",
@@ -171,7 +172,7 @@ export async function modelsCommand(opts: { query?: string; tier?: string; set?:
 
 /** Tell a running daemon to re-read the config it just had rewritten under it. */
 async function reloadDaemon(): Promise<void> {
-	const s = await status();
+	const s = await status({ port: loadConfig().claudeCode.port });
 	if (!s.running) return;
 	try {
 		await fetch(`${s.url}/jev-router/reload`, { method: "POST" });
@@ -238,7 +239,7 @@ switch (cmd) {
 		process.exit(s.running ? 0 : 1);
 	}
 	case "stop": {
-		const r = await stop();
+		const r = await stop({ port: loadConfig().claudeCode.port });
 		console.log(r.reason);
 		process.exit(r.stopped ? 0 : 1);
 	}
@@ -249,12 +250,12 @@ switch (cmd) {
 		process.exit(s.running ? 0 : 1);
 	}
 	case "status": {
-		const s = await status();
+		const s = await status({ port: loadConfig().claudeCode.port });
 		console.log(fmtStatus(s));
 		process.exit(s.running ? 0 : 1);
 	}
 	case "reload": {
-		const s = await status();
+		const s = await status({ port: loadConfig().claudeCode.port });
 		if (!s.running) {
 			console.log(`not running — ${s.reason}`);
 			process.exit(1);
@@ -285,7 +286,7 @@ switch (cmd) {
 	}
 	case "env": {
 		const cfg = loadConfig();
-		const s = await status();
+		const s = await status({ port: loadConfig().claudeCode.port });
 		const url = s.running ? s.url : `http://127.0.0.1:${cfg.claudeCode.port}`;
 		const env = claudeEnv(url, cfg);
 		if (flag("--write")) {

@@ -62,19 +62,36 @@ export type Status =
 	| { running: true; pid: number; url: string; startedAt: string; info: Record<string, unknown> }
 	| { running: false; stale?: PidFile; reason: string };
 
-/** Probe the daemon: pidfile → process alive → HTTP status answers. Anything less is "not running". */
-export async function status(opts: { pidFile?: string; timeoutMs?: number } = {}): Promise<Status> {
+/**
+ * Probe the daemon: pidfile → process alive → HTTP status answers. Anything less
+ * is "not running". With a `port` and no pidfile, the port is probed anyway — a
+ * daemon whose pidfile was lost is still serving, and reporting "not running"
+ * would make the next launch fail with EADDRINUSE instead of reusing it.
+ */
+export async function status(opts: { pidFile?: string; timeoutMs?: number; port?: number } = {}): Promise<Status> {
 	const entry = readPidFile(opts.pidFile);
-	if (!entry) return { running: false, reason: "no pidfile" };
+	if (!entry) {
+		if (opts.port === undefined) return { running: false, reason: "no pidfile" };
+		const adopted = await probe(`http://127.0.0.1:${opts.port}`, opts.timeoutMs ?? 1_500);
+		if (!adopted) return { running: false, reason: "no pidfile" };
+		return { running: true, pid: adopted.pid, url: `http://127.0.0.1:${opts.port}`, startedAt: "", info: adopted.info };
+	}
 	if (!pidAlive(entry.pid)) return { running: false, stale: entry, reason: `pid ${entry.pid} is not alive` };
+	const info = await probe(entry.url, opts.timeoutMs ?? 1_500);
+	if (!info) return { running: false, stale: entry, reason: `no answer on ${entry.url}` };
+	if (info.pid !== entry.pid) return { running: false, stale: entry, reason: `port ${entry.port} is served by pid ${String(info.pid)}, not ${entry.pid}` };
+	return { running: true, pid: entry.pid, url: entry.url, startedAt: entry.startedAt, info: info.info };
+}
+
+/** Ask `url` whether a jev-router daemon is there, and who it is. */
+async function probe(url: string, timeoutMs: number): Promise<{ pid: number; info: Record<string, unknown> } | undefined> {
 	try {
-		const res = await fetch(`${entry.url}/jev-router/status`, { signal: AbortSignal.timeout(opts.timeoutMs ?? 1_500) });
-		if (!res.ok) return { running: false, stale: entry, reason: `status endpoint answered ${res.status}` };
+		const res = await fetch(`${url}/jev-router/status`, { signal: AbortSignal.timeout(timeoutMs) });
+		if (!res.ok) return undefined;
 		const info = (await res.json()) as Record<string, unknown>;
-		if (info.pid !== entry.pid) return { running: false, stale: entry, reason: `port ${entry.port} is served by pid ${String(info.pid)}, not ${entry.pid}` };
-		return { running: true, pid: entry.pid, url: entry.url, startedAt: entry.startedAt, info };
-	} catch (err) {
-		return { running: false, stale: entry, reason: `no answer on ${entry.url} (${err instanceof Error ? err.message : String(err)})` };
+		return typeof info.pid === "number" ? { pid: info.pid, info } : undefined;
+	} catch {
+		return undefined;
 	}
 }
 
@@ -82,7 +99,7 @@ export async function status(opts: { pidFile?: string; timeoutMs?: number } = {}
 export async function serveForeground(opts: { cfg?: RouterConfig; port?: number; quiet?: boolean } = {}): Promise<void> {
 	const cfg = opts.cfg ?? loadConfig();
 	const say = opts.quiet ? () => {} : (m: string) => console.error(`[jev-router] ${m}`);
-	const existing = await status();
+	const existing = await status({ port: cfg.claudeCode.port });
 	if (existing.running) {
 		say(`already running: pid ${existing.pid} on ${existing.url}`);
 		process.exit(3);
@@ -108,7 +125,7 @@ export async function serveForeground(opts: { cfg?: RouterConfig; port?: number;
 
 /** Spawn `jev-router serve` detached and wait until it answers. */
 export async function start(opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}): Promise<Status> {
-	const current = await status();
+	const current = await status({ port: loadConfig().claudeCode.port });
 	if (current.running) return current;
 	if (current.stale) rmSync(pidPath(), { force: true });
 
@@ -134,8 +151,14 @@ export async function start(opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv 
 	}
 }
 
-export async function stop(opts: { timeoutMs?: number } = {}): Promise<{ stopped: boolean; reason: string }> {
-	const entry = readPidFile();
+export async function stop(opts: { timeoutMs?: number; port?: number } = {}): Promise<{ stopped: boolean; reason: string }> {
+	let entry = readPidFile();
+	if (!entry && opts.port !== undefined) {
+		// No pidfile, but something may still be serving our port (lost file,
+		// earlier install). Kill what answers, or the next start cannot bind.
+		const adopted = await probe(`http://127.0.0.1:${opts.port}`, 1_500);
+		if (adopted) entry = { pid: adopted.pid, port: opts.port, url: `http://127.0.0.1:${opts.port}`, startedAt: "" };
+	}
 	if (!entry) return { stopped: false, reason: "not running (no pidfile)" };
 	if (!pidAlive(entry.pid)) {
 		rmSync(pidPath(), { force: true });
@@ -541,7 +564,7 @@ export function resolveClaude(env: NodeJS.ProcessEnv = process.env): string | un
  */
 export async function launchClaude(args: string[], opts: { cfg?: RouterConfig } = {}): Promise<number> {
 	const cfg = opts.cfg ?? loadConfig();
-	const running = await status();
+	const running = await status({ port: cfg.claudeCode.port });
 	const own = running.running ? undefined : createProxy({ cfg, port: cfg.claudeCode.port });
 	const url = running.running ? running.url : own!.url;
 	const env = { ...process.env, ...claudeEnv(url, cfg) };

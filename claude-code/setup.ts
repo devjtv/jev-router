@@ -226,7 +226,7 @@ export async function setup(opts: { yes?: boolean } = {}): Promise<void> {
 	const claudeBin = resolveClaude();
 	const creds = resolveCreds();
 	const existing = existsSync(configPath());
-	const daemon = await status();
+	const daemon = await status({ port: cc.port });
 	p.note(
 		[
 			`bun          ${process.version}  (${process.execPath})`,
@@ -423,7 +423,7 @@ export async function setup(opts: { yes?: boolean } = {}): Promise<void> {
 	{
 		const s = p.spinner();
 		s.start(daemon.running ? "Reloading the daemon" : "Starting the daemon");
-		let st = await status();
+		let st = await status({ port: next.claudeCode.port });
 		if (st.running) await fetch(`${st.url}/jev-router/reload`, { method: "POST" }).catch(() => {});
 		else st = await start();
 		if (st.running) s.stop(`Daemon on ${st.url}`);
@@ -477,7 +477,7 @@ export async function setup(opts: { yes?: boolean } = {}): Promise<void> {
 				}),
 			);
 		}
-		const st = await status();
+		const st = await status({ port: next.claudeCode.port });
 		const r = writeClaudeSettings(next, st.running ? st.url : `http://127.0.0.1:${next.claudeCode.port}`, claudeSettingsPath(), statusLineMode);
 		if (r.error) p.log.error(`settings.json not written: ${r.error}`);
 		else p.log.success(r.changed.length ? `Updated ${r.path}: ${r.changed.join(", ")}` : `${r.path} already wired`);
