@@ -507,6 +507,62 @@ describe("gateway model", () => {
 		expect(leakedToolSyntax("<tool_call>{\"name\":\"Read\"}</tool_call>")).toBe(true);
 	});
 
+	test("a bare continuation reaches the gate with the previous turn attached and labelled", async () => {
+		const seen: { prompt: string; prior?: string }[] = [];
+		const proxy = makeProxy({}, {}, {
+			decide: async (prompt, _cfg, _signal, prior) => {
+				seen.push({ prompt, prior });
+				return { kind: "tier", tier: "deep", latencyMs: 1, source: "stub" };
+			},
+		});
+		proxies.push(proxy);
+		await post(proxy.url, body([
+			{ role: "user", content: [{ type: "text", text: "plan the redis migration" }] },
+			{ role: "assistant", content: [{ type: "text", text: "Phase 1 interface, Phase 2 dual-write." }] },
+			{ role: "user", content: [{ type: "text", text: "go" }] },
+		]));
+		expect(seen[0]!.prompt).toContain("continues the previous turn");
+		expect(seen[0]!.prior).toContain("plan the redis migration");
+		expect(seen[0]!.prior).toContain("Phase 1 interface"); // the plan itself, not just the ask
+		// The tier the gate chose is what the session pins.
+		expect(proxy.sessions.get("sess-1")?.tier).toBe("deep");
+	});
+
+	test("a real request gets the context but is not labelled a continuation", async () => {
+		const seen: { prompt: string; prior?: string }[] = [];
+		const proxy = makeProxy({}, {}, {
+			decide: async (prompt, _cfg, _signal, prior) => {
+				seen.push({ prompt, prior });
+				return { kind: "tier", tier: "standard", latencyMs: 1, source: "stub" };
+			},
+		});
+		proxies.push(proxy);
+		await post(proxy.url, body([
+			{ role: "user", content: [{ type: "text", text: "add a health endpoint" }] },
+			{ role: "assistant", content: [{ type: "text", text: "Added to server.ts." }] },
+			{ role: "user", content: [{ type: "text", text: "now make the retry path idempotent across three modules" }] },
+		]));
+		expect(seen[0]!.prompt).toBe("now make the retry path idempotent across three modules");
+		expect(seen[0]!.prior).toContain("add a health endpoint");
+	});
+
+	test("priorContextChars: 0 turns the context off", async () => {
+		const seen: (string | undefined)[] = [];
+		const proxy = makeProxy({ priorContextChars: 0 }, {}, {
+			decide: async (_prompt, _cfg, _signal, prior) => {
+				seen.push(prior);
+				return { kind: "tier", tier: "fast", latencyMs: 1, source: "stub" };
+			},
+		});
+		proxies.push(proxy);
+		await post(proxy.url, body([
+			{ role: "user", content: [{ type: "text", text: "add a health endpoint" }] },
+			{ role: "assistant", content: [{ type: "text", text: "Added." }] },
+			{ role: "user", content: [{ type: "text", text: "go" }] },
+		]));
+		expect(seen[0]).toBeUndefined();
+	});
+
 	test("a wire name carrying a modifier still routes (jev-router[1m])", async () => {
 		const proxy = makeProxy();
 		proxies.push(proxy);

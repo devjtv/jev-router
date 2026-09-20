@@ -180,6 +180,13 @@ export type RouterConfig = {
 	pick: PickMode;
 	/** Prompt text is truncated to this before it is sent to the gate. */
 	maxPromptChars: number;
+	/**
+	 * Budget for the previous turn handed to the gate as `prior_context`, in
+	 * characters. A follow-up like "go" is meaningless alone: it carries the
+	 * scope of the request it continues, so the gate is shown that request (and,
+	 * where the host exposes it, the assistant's reply). 0 disables it.
+	 */
+	priorContextChars: number;
 	/** Hard ceiling on the gate call; on expiry the turn proceeds unchanged. */
 	timeoutMs: number;
 	/** Minimum gap between two model switches. 0 routes every prompt. */
@@ -239,6 +246,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
 	mode: "tiers",
 	pick: "weighted",
 	maxPromptChars: 1_500,
+	priorContextChars: 1_000,
 	timeoutMs: 4_000,
 	cooldownMs: 0,
 	showStatus: true,
@@ -381,7 +389,7 @@ export function mergeConfig(file: unknown, base: RouterConfig = DEFAULT_CONFIG):
 		const v = src[k];
 		if (typeof v === "boolean") out[k] = v;
 	};
-	const num = (k: "maxPromptChars" | "timeoutMs" | "cooldownMs" | "cacheGuardTokens", min: number) => {
+	const num = (k: "maxPromptChars" | "priorContextChars" | "timeoutMs" | "cooldownMs" | "cacheGuardTokens", min: number) => {
 		const v = src[k];
 		if (typeof v === "number" && Number.isFinite(v) && v >= min) out[k] = v;
 	};
@@ -393,6 +401,7 @@ export function mergeConfig(file: unknown, base: RouterConfig = DEFAULT_CONFIG):
 	bool("repoSummary");
 	bool("shadow");
 	num("maxPromptChars", 50);
+	num("priorContextChars", 0);
 	num("timeoutMs", 100);
 	num("cooldownMs", 0);
 
@@ -519,6 +528,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RouterConfig {
 export function truncatePrompt(text: string, max: number): string {
 	const t = text.trim();
 	return t.length <= max ? t : `${t.slice(0, max)}\n… [truncated]`;
+}
+
+/**
+ * True when a message is only a continuation of the previous one — "go", "yes,
+ * do it", "ok, go ahead". A two-word turn is not a two-word job: the gate is
+ * told what it continues, and this is what marks it as a continuation.
+ *
+ * Every word must be one of a small set of assent/step words, so anything with
+ * its own subject matter ("yes but only for staging", "go through the auth
+ * module") is a real request and not treated as a continuation.
+ */
+const CONTINUATION_WORDS = new Set([
+	"go", "ok", "okay", "k", "yes", "yep", "yeah", "y", "sure", "do", "it", "that", "this", "so", "make", "please",
+	"proceed", "continue", "carry", "on", "next", "run", "apply", "ship", "sounds", "good", "great", "fine", "sg",
+	"confirm", "confirmed", "agreed", "correct", "right", "ahead", "then", "now", "all", "for", "them", "us",
+]);
+
+export function isBareContinuation(text: string): boolean {
+	const words = text.trim().toLowerCase().split(/[\s,!.;:]+/).filter(Boolean);
+	if (!words.length || words.length > 6) return false;
+	return words.every((w) => CONTINUATION_WORDS.has(w));
 }
 
 /** Weighted / uniform / first pick over a tier's candidate pool. */
@@ -1097,7 +1127,7 @@ export async function askTiers(
 	request: string,
 	repoSummary: string,
 	cfg: RouterConfig,
-	opts: { creds?: JevCreds; timeoutMs: number; fetchImpl?: typeof fetch; signal?: AbortSignal },
+	opts: { creds?: JevCreds; timeoutMs: number; fetchImpl?: typeof fetch; signal?: AbortSignal; priorContext?: string },
 ): Promise<Decision> {
 	const creds = opts.creds ?? resolveCreds(process.env, cfg.gate);
 	if (!creds) throw new Error("no Jev credential (set OPENROUTER_API_KEY or run jev-gate key set)");
@@ -1111,7 +1141,7 @@ export async function askTiers(
 			instructions: {
 				question: "Which model tier should handle `request`?",
 				focus:
-					"Judge the work the request implies, not its tone. Pick the cheapest tier that can complete it correctly; escalate when scope, blast radius, or missing decisions make a wrong answer expensive.",
+					"Judge the work the request implies, not its tone. A short reply that continues an earlier request — \"go\", \"yes\", \"do it\", \"continue\", \"same for the others\" — carries that request's scope: judge the work being continued, not the few words. `prior_context` is that earlier turn when it is present; treat a bare continuation with no `prior_context` as unclear rather than trivial. Pick the cheapest tier that can complete it correctly; escalate when scope, blast radius, or missing decisions make a wrong answer expensive.",
 			},
 			criteria,
 		},
@@ -1125,7 +1155,8 @@ export async function askTiers(
 			},
 		},
 	};
-	const { answers, latencyMs } = await callDecisions(creds, { request, repo_summary: repoSummary }, questions, opts);
+	const prior = opts.priorContext?.trim();
+	const { answers, latencyMs } = await callDecisions(creds, { request, repo_summary: repoSummary, ...(prior ? { prior_context: prior } : {}) }, questions, opts);
 	const tier = answers.tier?.choice ?? "";
 	if (!tier || !cfg.tiers[tier]) {
 		return {
@@ -1337,6 +1368,8 @@ export default function jevRouterExtension(pi: ExtensionAPI): void {
 		lastKeyAt: number;
 		warnedCreds: boolean;
 		gitCache?: { at: number; text: string };
+		/** The last prompt this session routed, for the gate's `prior_context`. */
+		priorPrompt?: string;
 	};
 	const sessions = new Map<string, SessionState>();
 	const stateFor = (ctx: ExtensionContext): SessionState => {
@@ -1392,15 +1425,25 @@ export default function jevRouterExtension(pi: ExtensionAPI): void {
 	const decideNow = async (prompt: string, ctx: ExtensionContext): Promise<Decision> => {
 		const request = truncatePrompt(prompt, cfg.maxPromptChars);
 		const summary = await repoSummary(ctx);
+		// This host shows us prompts, not replies, so the prior context is the
+		// previous *request* — enough for the gate to see that "go" follows a
+		// request worth more than two words.
+		const state = stateFor(ctx);
+		const prior =
+			cfg.priorContextChars > 0 && state.priorPrompt
+				? `user: ${truncatePrompt(state.priorPrompt, Math.floor(cfg.priorContextChars / 2))}`
+				: undefined;
 		// Honour the user's cancel of the turn, but never let a slow gate block it.
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
 		try {
+			const ask = isBareContinuation(prompt) && prior ? `${request}  [continues the previous turn — judge that work, not these words]` : request;
 			return cfg.mode === "preflight"
-				? await askPreflight(request, summary, { timeoutMs: cfg.timeoutMs, signal: controller.signal })
-				: await askTiers(request, summary, cfg, { timeoutMs: cfg.timeoutMs, signal: controller.signal });
+				? await askPreflight(ask, summary, { timeoutMs: cfg.timeoutMs, signal: controller.signal })
+				: await askTiers(ask, summary, cfg, { timeoutMs: cfg.timeoutMs, signal: controller.signal, ...(prior ? { priorContext: prior } : {}) });
 		} finally {
 			clearTimeout(timer);
+			state.priorPrompt = prompt;
 		}
 	};
 

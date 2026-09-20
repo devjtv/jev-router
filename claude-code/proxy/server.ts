@@ -40,6 +40,7 @@ import {
 	planRoute,
 	resolveCreds,
 	truncatePrompt,
+	isBareContinuation,
 	type Decision,
 	type RouterConfig,
 } from "../../extensions/jev-router.ts";
@@ -52,6 +53,7 @@ import {
 	hasImages,
 	leakedToolSyntax,
 	modelFamily,
+	priorTurnContext,
 	providerPreference,
 	promptText,
 	sessionKey,
@@ -82,8 +84,8 @@ export type ProxyOptions = {
 	port?: number;
 	/** Overrides `cfg.claudeCode.upstream`. */
 	upstream?: string;
-	/** Test seam: replaces the Jev call. */
-	decide?: (prompt: string, cfg: RouterConfig, signal: AbortSignal) => Promise<Decision>;
+	/** Test seam: replaces the Jev call. `prior` is the previous turn, when known. */
+	decide?: (prompt: string, cfg: RouterConfig, signal: AbortSignal, prior?: string) => Promise<Decision>;
 	/**
 	 * Test seam for the OpenRouter credential: a string to use, `null` to act as
 	 * if none is configured. Omit to read the environment / secrets file.
@@ -180,17 +182,17 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 
 	const decide =
 		opts.decide ??
-		(async (prompt: string, c: RouterConfig, signal: AbortSignal): Promise<Decision> =>
+		(async (prompt: string, c: RouterConfig, signal: AbortSignal, prior?: string): Promise<Decision> =>
 			c.mode === "preflight"
 				? askPreflight(prompt, "", { timeoutMs: c.timeoutMs, signal })
-				: askTiers(prompt, "", c, { timeoutMs: c.timeoutMs, signal }));
+				: askTiers(prompt, "", c, { timeoutMs: c.timeoutMs, signal, ...(prior ? { priorContext: prior } : {}) }));
 
-	async function gate(prompt: string): Promise<Decision> {
+	async function gate(prompt: string, priorContext?: string): Promise<Decision> {
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
 		const started = Date.now();
 		try {
-			return await decide(truncatePrompt(prompt, cfg.maxPromptChars), cfg, controller.signal);
+			return await decide(truncatePrompt(prompt, cfg.maxPromptChars), cfg, controller.signal, priorContext);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			if (cfg.log) log({ event: "gate_error", mode: cfg.mode, error: message, prompt: prompt.slice(0, 80) });
@@ -249,7 +251,11 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 			tier = undefined;
 			reason = `${(tokens ?? estimateTokens(body)).toLocaleString()} tokens exceeds maxRouteTokens — ${model}`;
 		} else {
-			decision = await gate(prompt);
+			const prior = priorTurnContext(body, cfg.priorContextChars);
+			decision = await gate(
+				isBareContinuation(prompt) && prior ? `${prompt}  [continues the previous turn — judge that work, not these words]` : prompt,
+				prior,
+			);
 			const route = planRoute(decision, cfg, rng);
 			if (route.kind === "keep") {
 				reason = route.reason;

@@ -131,6 +131,38 @@ the whole thing off with `/jev-router off` if that matters more than the
 savings; a per-agent toggle would need OMP to expose agent identity to
 extensions, which it does not today.
 
+## What the gate sees
+
+Jev decides from a **fixed, small state** — not the conversation:
+
+| field | contents |
+| --- | --- |
+| `request` | the user's own text for this turn, truncated to `maxPromptChars` (1500) |
+| `prior_context` | the previous turn — the earlier request plus, where the host exposes it, the assistant's reply. Budget `priorContextChars` (1000); `0` disables |
+| `repo_summary` | OMP: `cwd · git branch · N changed files`. Claude Code: not yet (see below) |
+| `questions` | your tier rubrics — config, not context |
+
+Nothing else goes: no full history, no tool results, no file contents, no images
+(which is why `onImages` exists). Prior *assistant* text is available to the
+Claude Code proxy (it has the message array); the OMP extension sees only
+prompts, so it passes the previous prompt and remembers it per session.
+
+**Why `prior_context` exists.** `go` after a plan is two characters carrying a
+plan's worth of work. Measured against the live gate:
+
+| prior turn | follow-up | routed |
+| --- | --- | --- |
+| `rename foo to bar` | `ok` | **fast** (77%) |
+| `make the retry path idempotent across three modules` | `go` | **deep** (49%) |
+| *a plan for the redis migration* | `do it` | **planner** (75%) |
+| *(none)* | `ok` | standard, 26% — treated as unclear |
+
+So the context is what makes a continuation cheap when the work was cheap *and*
+expensive when it was expensive. A bare continuation with no context is
+deliberately judged *unclear* rather than trivial, so ambiguity escalates
+instead of silently downgrading.
+
+
 ## Cost and safety guards
 
 Four things can go wrong with a router, and each has a guard that runs before
@@ -179,6 +211,7 @@ routing or invert your tiers.
   "mode": "tiers",              // "tiers" | "preflight"
   "pick": "weighted",           // "weighted" | "uniform" | "first"
   "maxPromptChars": 1500,       // prompt text sent to the gate is truncated here
+  "priorContextChars": 1000,    // budget for the previous turn ("go" after a plan); 0 disables
   "timeoutMs": 4000,            // past this the turn proceeds on the current model
   "cooldownMs": 0,              // minimum gap between two switches
   "showStatus": true,           // status-line segment, e.g. jev:fast/@jev-fast

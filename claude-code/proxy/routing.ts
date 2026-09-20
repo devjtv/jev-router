@@ -272,6 +272,65 @@ export function leakedToolSyntax(chunk: string): boolean {
 	return /<function=|<\/function>|<tool_call>|\[TOOL_CALLS\]|<\|tool_call\|>/.test(chunk);
 }
 
+/**
+ * The previous turn, for the gate. `"go"` is two characters and no signal; the
+ * request it continues is the actual work, so a short continuation is judged by
+ * what came before it. Walks back past tool-result batches to the previous user
+ * turn, and includes whatever the assistant said in reply (a plan, usually) —
+ * both capped so the gate's state stays small and its latency flat.
+ */
+export function priorTurnContext(body: MessagesBody, budgetChars: number): string | undefined {
+	if (budgetChars <= 0) return undefined;
+	const messages = Array.isArray(body.messages) ? (body.messages as Message[]) : [];
+	// The current user turn is the last non-system message; everything before it
+	// is context.
+	let cur = messages.length - 1;
+	for (; cur >= 0 && messages[cur]!.role === "system"; cur--) {
+		/* skip trailing system lines */
+	}
+	if (cur < 0) return undefined;
+
+	let userIdx = -1;
+	for (let i = cur - 1; i >= 0; i--) {
+		const m = messages[i]!;
+		if (m.role !== "user") continue;
+		if (typeof m.content === "string") {
+			userIdx = i;
+			break;
+		}
+		if (!asBlocks(m.content).some((b) => b.type === "tool_result")) {
+			userIdx = i;
+			break;
+		}
+	}
+	if (userIdx < 0) return undefined;
+
+	// Text of the assistant message that followed, if any — the plan itself.
+	let assistant = "";
+	for (let i = userIdx + 1; i < cur; i++) {
+		const m = messages[i]!;
+		if (m.role !== "assistant") continue;
+		const text = asBlocks(m.content)
+			.filter((b) => b.type === "text" && typeof b.text === "string")
+			.map((b) => b.text as string)
+			.join("\n")
+			.trim();
+		if (text) assistant = text; // keep the last one before the current turn
+	}
+
+	const user = cleanText(messages[userIdx]!.content);
+	const half = Math.floor(budgetChars / 2);
+	const clip = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, n)}… [clipped]`);
+	const parts: string[] = [];
+	if (user) parts.push(`user: ${clip(user, assistant ? half : budgetChars)}`);
+	if (assistant) parts.push(`assistant: ${clip(assistant, half)}`);
+	return parts.length ? parts.join("\n") : undefined;
+}
+
+// isBareContinuation lives in the shared core (extensions/jev-router.ts) so both
+// hosts use one definition; re-exported here for the proxy and its tests.
+export { isBareContinuation } from "../../extensions/jev-router.ts";
+
 /** Detect an upstream 400 caused by a field the routed model does not accept,
  * so the proxy can strip it and retry instead of failing the turn. Order
  * matters: a `clear_thinking` complaint mentions thinking but is about

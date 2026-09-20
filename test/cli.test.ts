@@ -10,8 +10,9 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_CONFIG } from "../extensions/jev-router.ts";
+import { DEFAULT_CONFIG, askTiers, isBareContinuation, type RouterConfig } from "../extensions/jev-router.ts";
 import { auditBins, chainedStatusLine, expectedBins, mergeClaudeSettings, readPidFile, renderStatusLine, serviceDefinition, statusLineSetting, writePidFile, BIN } from "../claude-code/proxy/daemon.ts";
+import { priorTurnContext } from "../claude-code/proxy/routing.ts";
 import { configPatch, patchConfigText } from "../claude-code/setup.ts";
 import { claudeEnv, claudeSettings } from "../claude-code/proxy/server.ts";
 
@@ -72,6 +73,68 @@ describe("settings.json merge", () => {
 		expect(broken.error).toContain("does not parse");
 		expect(broken.text).toBe("{oops");
 		expect(mergeClaudeSettings("[]", env, add).error).toContain("not an object");
+	});
+});
+
+describe("prior turn context", () => {
+	test("a follow-up carries the request it continues, capped", () => {
+		const messages = [
+			{ role: "user", content: [{ type: "text", text: "plan the migration from sqlite to postgres, three phases" }] },
+			{ role: "assistant", content: [{ type: "text", text: "Phase 1: export. Phase 2: schema. Phase 3: import." }] },
+			{ role: "user", content: [{ type: "text", text: "go" }] },
+		];
+		const ctx = priorTurnContext({ messages }, 1_000)!;
+		expect(ctx).toContain("plan the migration from sqlite to postgres");
+		expect(ctx).toContain("Phase 1: export");
+		expect(ctx).not.toContain("go"); // the current turn is not context
+		// Budget is split, and a long reply is clipped rather than dropped.
+		const tight = priorTurnContext({ messages }, 60)!;
+		expect(tight.length).toBeLessThan(200);
+		expect(tight).toContain("[clipped]");
+	});
+
+	test("walks back past tool results and skips nothing else", () => {
+		const messages = [
+			{ role: "user", content: [{ type: "text", text: "refactor the config loader" }] },
+			{ role: "assistant", content: [{ type: "text", text: "Done, 3 files changed." }] },
+			{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+			{ role: "assistant", content: [{ type: "text", text: "Anything else?" }] },
+			{ role: "user", content: [{ type: "text", text: "go" }] },
+		];
+		const ctx = priorTurnContext({ messages }, 1_000)!;
+		// The tool_result batch is not a turn; the request before it is.
+		expect(ctx).toContain("refactor the config loader");
+		expect(ctx).toContain("Anything else?"); // the last assistant reply still informs it
+	});
+
+	test("the first turn of a session has no context, and 0 disables it", () => {
+		expect(priorTurnContext({ messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] }, 1_000)).toBeUndefined();
+		const one = { messages: [{ role: "user", content: [{ type: "text", text: "a" }] }, { role: "user", content: [{ type: "text", text: "go" }] }] };
+		expect(priorTurnContext(one, 0)).toBeUndefined();
+		expect(priorTurnContext(one, 100)).toContain("user: a");
+	});
+
+	test("bare continuations are recognised, real requests are not", () => {
+		for (const t of ["go", "Go", "yes", "do it", "proceed", "continue", "ok, go ahead", "y", "ship it"]) expect(isBareContinuation(t)).toBe(true);
+		for (const t of ["go through the auth module and fix the token check", "yes but only for the staging config", "continue the refactor across the other three modules", "", "gopher"]) {
+			expect(isBareContinuation(t)).toBe(false);
+		}
+	});
+
+	test("askTiers sends prior_context only when there is one", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const creds = { url: "https://example.invalid/decide", key: "k", model: "m" };
+		const fetchImpl = (async (_url: string, init: { body: string }) => {
+			bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+			return Response.json({ answers: { tier: { choice: "fast", confidence: 0.9 } } });
+		}) as unknown as typeof fetch;
+		await askTiers("go", "", DEFAULT_CONFIG, { creds, timeoutMs: 1_000, fetchImpl, priorContext: "user: plan the migration" });
+		await askTiers("go", "", DEFAULT_CONFIG, { creds, timeoutMs: 1_000, fetchImpl });
+		expect(bodies[0]!.state).toEqual({ request: "go", repo_summary: "", prior_context: "user: plan the migration" });
+		expect(bodies[1]!.state).toEqual({ request: "go", repo_summary: "" });
+		// The gate is told how to read a continuation.
+		const questions = bodies[0]!.questions as { tier: { instructions: { focus: string } } };
+		expect(questions.tier.instructions.focus).toContain("continues an earlier request");
 	});
 });
 
