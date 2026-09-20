@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Oh My Pi extension: pick the model and thinking effort for each prompt with TypeSafe Jev.",
+  "bin": { "jev-router": "./bin/jev-router.ts" },
   "omp": {
     "extensions": ["./extensions/jev-router.ts"]
   },
@@ -13,9 +14,9 @@
     "live:preflight": "bun test/live.ts preflight",
     "typecheck": "tsc --noEmit",
     "install:extension": "bun scripts/install.ts",
-    "cc": "bun claude-code/launch.ts",
-    "cc:proxy": "bun claude-code/proxy/server.ts",
-    "cc:env": "bun claude-code/launch.ts --env"
+    "cc": "bun bin/jev-router.ts claude",
+    "cc:proxy": "bun bin/jev-router.ts serve",
+    "cc:env": "bun bin/jev-router.ts env"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",

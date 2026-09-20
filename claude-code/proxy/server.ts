@@ -88,6 +88,8 @@ export type Proxy = {
 	url: string;
 	port: number;
 	sessions: Map<string, SessionState>;
+	/** Re-read the config file (or take one) without dropping sessions. */
+	reload: (cfg?: RouterConfig) => void;
 	stop: () => void;
 };
 
@@ -123,9 +125,17 @@ function responseHeaders(upstream: Headers): Headers {
 }
 
 export function createProxy(opts: ProxyOptions = {}): Proxy {
-	const cfg = opts.cfg ?? loadConfig();
-	const cc = cfg.claudeCode;
-	const upstream = (opts.upstream ?? cc.upstream).replace(/\/+$/, "");
+	let cfg = opts.cfg ?? loadConfig();
+	let cc = cfg.claudeCode;
+	let upstream = (opts.upstream ?? cc.upstream).replace(/\/+$/, "");
+	const startedAt = Date.now();
+	/** Swap the config in place; sessions and learned quirks survive. */
+	const reload = (next: RouterConfig = loadConfig()) => {
+		cfg = next;
+		cc = cfg.claudeCode;
+		upstream = (opts.upstream ?? cc.upstream).replace(/\/+$/, "");
+		trace(`config reloaded (${cfg.enabled ? cfg.mode : "disabled"}, ${Object.keys(cfg.tiers).length} tiers)`);
+	};
 	const fetchImpl = opts.fetchImpl ?? fetch;
 	const log = opts.log ?? ((line) => appendLog(line));
 	const trace = opts.trace ?? (() => {});
@@ -357,6 +367,9 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 		if (debug) log({ event: "request", host: "claude-code", method: req.method, path: url.pathname, agentId: req.headers.get("x-claude-code-agent-id") ?? undefined });
 		if (url.pathname === "/jev-router/status") {
 			return Response.json({
+				pid: process.pid,
+				uptimeMs: Date.now() - startedAt,
+				url: `http://127.0.0.1:${server.port}`,
 				model: cc.model,
 				upstream,
 				enabled: cfg.enabled,
@@ -367,6 +380,10 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 				sessions: Object.fromEntries(sessions),
 				quirks: Object.fromEntries([...quirks].map(([m, s]) => [m, [...s]])),
 			});
+		}
+		if (req.method === "POST" && url.pathname === "/jev-router/reload") {
+			reload();
+			return Response.json({ ok: true, enabled: cfg.enabled, mode: cfg.mode, tiers: Object.keys(cfg.tiers) });
 		}
 		if (req.method === "HEAD" && url.pathname === "/api/hello") return new Response(null, { status: 200 });
 		const isMessages = url.pathname === "/v1/messages" || url.pathname === "/v1/messages/count_tokens";
@@ -467,11 +484,23 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 		},
 	});
 
+	// A daemon outlives many Claude Code sessions; forget ones idle for hours.
+	const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
+	const sweep = setInterval(() => {
+		const cutoff = Date.now() - SESSION_TTL_MS;
+		for (const [key, state] of sessions) if (state.updatedAt < cutoff) sessions.delete(key);
+	}, 10 * 60 * 1000);
+	if (typeof sweep === "object" && "unref" in sweep) sweep.unref();
+
 	return {
 		url: `http://127.0.0.1:${server.port}`,
 		port: server.port ?? 0,
 		sessions,
-		stop: () => server.stop(true),
+		reload,
+		stop: () => {
+			clearInterval(sweep);
+			server.stop(true);
+		},
 	};
 }
 
@@ -488,12 +517,4 @@ export function claudeEnv(proxyUrl: string, cfg: RouterConfig): Record<string, s
 		ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION: `Routes each turn with Jev: ${tiers}`,
 		ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking",
 	};
-}
-
-if (import.meta.main) {
-	const cfg = loadConfig();
-	const proxy = createProxy({ cfg, trace: (m) => console.error(`[jev-router] ${m}`) });
-	console.error(`[jev-router] gateway model "${cfg.claudeCode.model}" listening on ${proxy.url} → ${cfg.claudeCode.upstream}`);
-	for (const [k, v] of Object.entries(claudeEnv(proxy.url, cfg))) console.error(`  ${k}=${v}`);
-	console.error(`  then: claude --model ${cfg.claudeCode.model}`);
 }

@@ -1,59 +1,30 @@
 #!/usr/bin/env bun
 /**
- * Start the jev-router gateway model and launch Claude Code on it.
+ * Start Claude Code on the jev-router gateway model.
  *
- *   bun claude-code/launch.ts                    # claude --model jev-router
- *   bun claude-code/launch.ts -p "fix the typo"  # any claude args pass through
- *   bun claude-code/launch.ts --env              # print the env block for settings.json and exit
+ *   bun claude-code/launch.ts [claude args]   ≡  jev-router claude [claude args]
+ *   bun claude-code/launch.ts --env           ≡  jev-router env
+ *   bun claude-code/launch.ts --tail          ≡  jev-router logs -f
  *
- * The proxy lives for exactly as long as the `claude` process. Nothing is
- * printed to stdout while claude runs — its TUI owns the terminal — so routing
- * decisions go to `~/.omp/agent/jev-router.log` (see `/jev-router stats` in OMP
- * or `bun claude-code/launch.ts --tail`).
+ * Kept for the README paths; the CLI in bin/jev-router.ts is the real entry.
+ * A running daemon is reused; otherwise a private proxy lives as long as claude.
  */
 
-import { loadConfig, logPath } from "../extensions/jev-router.ts";
-import { claudeEnv, createProxy } from "./proxy/server.ts";
+import { loadConfig } from "../extensions/jev-router.ts";
+import { launchClaude, status, tailLog } from "./proxy/daemon.ts";
+import { claudeEnv } from "./proxy/server.ts";
 
 const args = process.argv.slice(2);
-const cfg = loadConfig();
 
 if (args.includes("--env")) {
-	// A settings.json `env` block for people who run the proxy themselves.
-	const env = claudeEnv(`http://127.0.0.1:${cfg.claudeCode.port}`, cfg);
-	console.log(JSON.stringify({ env, model: cfg.claudeCode.model }, null, 2));
+	const cfg = loadConfig();
+	const s = await status();
+	const url = s.running ? s.url : `http://127.0.0.1:${cfg.claudeCode.port}`;
+	console.log(JSON.stringify({ env: claudeEnv(url, cfg), model: cfg.claudeCode.model }, null, 2));
 	process.exit(0);
 }
-
 if (args.includes("--tail")) {
-	const proc = Bun.spawn(process.platform === "win32" ? ["powershell", "-NoProfile", "-Command", `Get-Content -Wait -Tail 20 '${logPath()}'`] : ["tail", "-f", logPath()], {
-		stdio: ["inherit", "inherit", "inherit"],
-	});
-	process.exit(await proc.exited);
+	await tailLog({ follow: true });
+	process.exit(0);
 }
-
-const proxy = createProxy({ cfg, port: cfg.claudeCode.port === 0 ? 0 : cfg.claudeCode.port });
-const env = { ...process.env, ...claudeEnv(proxy.url, cfg) };
-const claudeArgs = args.some((a) => a === "--model" || a.startsWith("--model=")) ? args : ["--model", cfg.claudeCode.model, ...args];
-// `CLAUDE_BIN` wins; otherwise prefer a real executable over a `.cmd` shim,
-// which on this machine is a corrupted npm leftover that exits silently.
-const bin = process.env.CLAUDE_BIN ?? Bun.which("claude.exe") ?? Bun.which("claude");
-if (!bin) {
-	console.error("jev-router: cannot find `claude` on PATH (set CLAUDE_BIN)");
-	proxy.stop();
-	process.exit(127);
-}
-const cmd = [bin, ...claudeArgs];
-const child = Bun.spawn(cmd, { env, stdio: ["inherit", "inherit", "inherit"] });
-const shutdown = () => {
-	try {
-		child.kill();
-	} catch {
-		/* already gone */
-	}
-};
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-const code = await child.exited;
-proxy.stop();
-process.exit(code);
+process.exit(await launchClaude(args));

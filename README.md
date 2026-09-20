@@ -53,7 +53,7 @@ Install jev-router (https://github.com/devjtv/jev-router) for me. Steps: (1) git
 For Claude Code (the gateway model, see [below](#claude-code)):
 
 ```
-Set up the jev-router gateway model for Claude Code (https://github.com/devjtv/jev-router). Steps: (1) git clone it to ~/.jev-router (git pull if it exists) and run `bun install` there; (2) make sure a Jev key is available: one of OPENROUTER_API_KEY / TYPESAFE_API_KEY / JEV_API_KEY in the environment, or ~/.jev-gate/config.json, or ~/.omp/agent/.secrets/openrouter.key (mode 600) — ask me for an OpenRouter key if none exists; (3) run `bun test test/claude-code-proxy.test.ts` in the repo and report the result; (4) run `bun claude-code/launch.ts --env` and show me the printed env block; (5) tell me how to start it: `bun ~/.jev-router/claude-code/launch.ts` launches Claude Code on the `jev-router` model with the proxy alive for the session, or add a shell alias for it. Do not change ~/.claude/settings.json unless I ask; the launcher passes the env itself.
+Set up the jev-router gateway model for Claude Code (https://github.com/devjtv/jev-router). Steps: (1) `bun add -g github:devjtv/jev-router` so `jev-router` is on PATH (if that fails, git clone to ~/.jev-router, `bun install`, `bun link`); (2) make sure a Jev key is available: one of OPENROUTER_API_KEY / TYPESAFE_API_KEY / JEV_API_KEY in the environment, or ~/.jev-gate/config.json, or ~/.omp/agent/.secrets/openrouter.key (mode 600) — ask me for an OpenRouter key if none exists; (3) run `jev-router start` then `jev-router status` and show me the output; (4) run `jev-router route "fix the typo in the README"` to prove the gate answers; (5) ask me whether to (a) run `jev-router env --write` so plain `claude` uses the jev-router model from now on, and (b) run `jev-router service install` so the proxy starts at login — do neither without my yes. Do not edit ~/.claude/settings.json by hand; `env --write` does it with a backup.
 ```
 
 ## Two decision modes
@@ -244,7 +244,7 @@ Environment overrides: `JEV_ROUTER_CONFIG`, `JEV_ROUTER_LOG`,
 ## Verifying
 
 ```bash
-bun test              # 119 tests: config merge, guards, tier/role mapping, YAML seeding, CC hook, CC gateway proxy
+bun test              # 127 tests: config merge, guards, tier/role mapping, YAML seeding, CC hook, CC gateway proxy, CLI/daemon
 bun test/live.ts      # real Jev calls + a stub host: proves setModel/setThinkingLevel fire,
                       # and that each guard holds when the route is real
 bun test/live.ts preflight
@@ -288,12 +288,29 @@ claude ──▶ 127.0.0.1:47131 (model: jev-router) ──▶ jev: which tier? 
                                                     ~0.3s, once per user turn
 ```
 
+### CLI and background service
+
 ```bash
-bun claude-code/launch.ts                 # starts the proxy, runs `claude --model jev-router`, stops it when claude exits
-bun claude-code/launch.ts -p "fix the typo in the README title"
-bun claude-code/launch.ts --env           # print the env block if you'd rather run the proxy yourself
-bun claude-code/proxy/server.ts           # the proxy alone, with the env it needs printed to stderr
+bun add -g github:devjtv/jev-router      # or, in a clone: bun link  → `jev-router` on PATH
+
+jev-router start                          # background proxy; pidfile in ~/.omp/agent, log in ~/.omp/agent/jev-router-proxy.log
+jev-router status                         # pid, url, tier → model map, live sessions
+jev-router env --write                    # merge the env block into ~/.claude/settings.json (backs up first)
+claude                                    # …then plain claude starts on the jev-router model
+
+jev-router service install                # start at login: systemd --user / launchd / Windows Task Scheduler
+jev-router service show                   # print the unit/plist/task it would write
+jev-router claude -p "fix the typo"       # one session; reuses the daemon, or runs a private proxy that dies with claude
+jev-router reload                         # re-read jev-router.json without dropping sessions (also: SIGHUP)
+jev-router logs -f                        # follow the routing log
+jev-router route "make retries idempotent across three modules"   # dry-run the gate
+jev-router stop | restart | serve         # serve = foreground
 ```
+
+The pidfile is written by the server itself and carries the bound port, so
+`"port": 0` works; `status` trusts it only after the pid is alive *and* the
+status endpoint answers with that pid. Sessions idle for six hours are evicted.
+`bun claude-code/launch.ts` still works and is the same as `jev-router claude`.
 
 Your claude.ai login keeps working: with only `ANTHROPIC_BASE_URL` set, Claude
 Code still authenticates with the saved OAuth session and the proxy forwards
@@ -389,8 +406,11 @@ test/claude-code-hook.test.ts  spawns the Claude Code hook as the host does
 test/claude-code-proxy.test.ts the gateway model against a stub upstream: pinning, guards, compat retries, subagents
 claude-code/proxy/routing.ts   pure request shaping: turn detection, prompt text, tier -> model, field stripping
 claude-code/proxy/server.ts    the gateway model (Bun.serve): per-turn routing, streaming relay, usage tracking
-claude-code/launch.ts          start the proxy and run `claude --model jev-router` on it
+claude-code/proxy/daemon.ts    pidfile lifecycle, detached start/stop, service adapters, settings.json merge, claude launch
+bin/jev-router.ts              the CLI: serve/start/stop/status/reload/service/claude/env/logs/route
+claude-code/launch.ts          thin wrapper ≡ `jev-router claude`
 claude-code/hooks/             the PreModelSwitch cache-guard plugin
+test/cli.test.ts               pidfile, settings merge, service definitions, a real detached start→stop cycle
 scripts/install.ts         writes the shim into the native extension directory
 .omp-plugin/marketplace.json  OMP marketplace catalog (plugin source = this repo root)
 ```
