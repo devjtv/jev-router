@@ -1,0 +1,13 @@
+{
+  "name": "jev-router",
+  "owner": {
+    "name": "jakey"
+  },
+  "plugins": [
+    {
+      "name": "jev-router",
+      "source": "./",
+      "description": "Prompt-cache guard for model switches: tells you what a switch re-sends uncached, and can ask or refuse past a token threshold."
+    }
+  ]
+}

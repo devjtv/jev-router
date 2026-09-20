@@ -1,0 +1,13 @@
+{
+  "name": "jev-router",
+  "owner": {
+    "name": "jakey"
+  },
+  "plugins": [
+    {
+      "name": "jev-router",
+      "source": "./",
+      "description": "Route each prompt to a model tier and thinking effort with TypeSafe Jev (a System One decision model). Modes: direct tier choice, or jev-gate's measured preflight preset. Cheap prompts stop paying for deep effort."
+    }
+  ]
+}

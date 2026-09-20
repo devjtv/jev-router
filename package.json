@@ -1,0 +1,22 @@
+{
+  "name": "jev-router",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Oh My Pi extension: pick the model and thinking effort for each prompt with TypeSafe Jev.",
+  "omp": {
+    "extensions": ["./extensions/jev-router.ts"]
+  },
+  "scripts": {
+    "test": "bun test",
+    "live": "bun test/live.ts",
+    "live:preflight": "bun test/live.ts preflight",
+    "typecheck": "tsc --noEmit",
+    "install:extension": "bun scripts/install.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/node": "^20.11.29",
+    "typescript": "^5.4.2"
+  }
+}

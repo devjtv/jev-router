@@ -1,0 +1,5 @@
+{
+  "name": "jev-router",
+  "version": "0.1.0",
+  "description": "Guards Claude Code model switches against prompt-cache cost. Reports what a switch re-sends uncached, and can ask or refuse past a threshold."
+}
