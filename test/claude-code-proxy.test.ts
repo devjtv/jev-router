@@ -8,9 +8,10 @@
  */
 
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, baseModelId, mergeConfig, type Decision, type RouterConfig } from "../extensions/jev-router.ts";
+import { DEFAULT_CONFIG, baseModelId, mergeConfig, PROVIDER_MODELS, resolveCreds, writeJevKey, writeLegacyKey, type Decision, type RouterConfig } from "../extensions/jev-router.ts";
 import {
 	apiEffort,
 	applyTarget,
@@ -208,6 +209,80 @@ describe("claudeCode config", () => {
 		expect("junk" in merged.claudeCode.models).toBe(false);
 		// Defaults are not shared by reference.
 		expect(merged.claudeCode.models).not.toBe(DEFAULT_CONFIG.claudeCode.models);
+	});
+
+	test("the gate provider picks the endpoint, and config/env override it in that order", () => {
+		const home = mkdtempSync(join(tmpdir(), "jev-creds-"));
+		const agent = join(home, "agent");
+		mkdirSync(join(agent, ".secrets"), { recursive: true });
+		writeFileSync(join(agent, ".secrets", "typesafe.key"), "ts-key\n");
+		writeFileSync(join(agent, ".secrets", "openrouter.key"), "or-key\n");
+		const env = { PI_CODING_AGENT_DIR: agent, JEV_GATE_CONFIG: join(home, "no-gate-config.json") } as NodeJS.ProcessEnv;
+
+		// Each provider reads its *own* file — the bug this guards: a TypeSafe key
+		// must never be sent to the OpenRouter endpoint.
+		const or = resolveCreds(env, { provider: "openrouter", endpoint: undefined, model: undefined })!;
+		expect(or.key).toBe("or-key");
+		expect(or.url).toContain("openrouter.ai");
+		const ts = resolveCreds(env, { provider: "typesafe", endpoint: undefined, model: undefined })!;
+		expect(ts.key).toBe("ts-key");
+		expect(ts.url).toBe("https://api.typesafe.ai/v1/systemone"); // the route its OpenAPI spec lists
+		expect(ts.model).toBe("jev-latest"); // TypeSafe's own name for the same model
+		// The two providers name the model differently, and each must get its own.
+		expect(or.model).toBe("typesafe/jev-1.13");
+		expect(PROVIDER_MODELS.typesafe).not.toBe(PROVIDER_MODELS.openrouter);
+
+		// Config endpoint/model apply to the configured provider; env wins over config.
+		const custom = resolveCreds(env, { provider: "typesafe", endpoint: "https://gate.example/decide", model: "typesafe/jev-2" })!;
+		expect(custom.url).toBe("https://gate.example/decide");
+		expect(custom.model).toBe("typesafe/jev-2");
+		const envWins = resolveCreds({ ...env, JEV_ENDPOINT: "https://env.example/decide", JEV_MODEL: "env-model" }, { provider: "typesafe", endpoint: "https://gate.example/decide", model: "typesafe/jev-2" })!;
+		expect(envWins.url).toBe("https://env.example/decide");
+		expect(envWins.model).toBe("env-model");
+
+		// Environment keys pick the provider by themselves, whichever config says.
+		const envKey = resolveCreds({ ...env, TYPESAFE_API_KEY: "from-env" }, { provider: "openrouter", endpoint: undefined, model: undefined })!;
+		expect(envKey.url).toBe("https://api.typesafe.ai/v1/systemone");
+		expect(envKey.key).toBe("from-env");
+		expect(envKey.model).toBe("jev-latest"); // the env-picked provider decides the name too
+		expect(resolveCreds({ ...env, OPENROUTER_API_KEY: "or-env", TYPESAFE_API_KEY: "ts-env" }, { provider: "typesafe", endpoint: undefined, model: undefined })!.url).toContain("openrouter.ai");
+
+		// jev-gate's key is bound to the endpoint in its own config, so it answers
+		// only for that provider: choosing TypeSafe must not keep calling
+		// OpenRouter with an OpenRouter key.
+		const gateCfg = join(home, "gate-config.json");
+		writeFileSync(gateCfg, JSON.stringify({ apiKey: "gate-key", endpoint: "https://openrouter.ai/api/alpha/decisions" }));
+		const gateEnv = { ...env, JEV_GATE_CONFIG: gateCfg };
+		expect(resolveCreds(gateEnv, { provider: "openrouter", endpoint: undefined, model: undefined })!.key).toBe("gate-key");
+		const askedTypesafe = resolveCreds(gateEnv, { provider: "typesafe", endpoint: undefined, model: undefined })!;
+		expect(askedTypesafe.key).toBe("ts-key"); // the TypeSafe file, not jev-gate's key
+		expect(askedTypesafe.url).toBe("https://api.typesafe.ai/v1/systemone");
+		// An unknown host is a custom gateway: assumed to match what was asked.
+		writeFileSync(gateCfg, JSON.stringify({ apiKey: "custom-key", endpoint: "https://gate.internal/decide" }));
+		expect(resolveCreds(gateEnv, { provider: "typesafe", endpoint: undefined, model: undefined })!.key).toBe("custom-key");
+
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	test("writeJevKey saves per provider and keeps the legacy name for OpenRouter", () => {
+		const home = mkdtempSync(join(tmpdir(), "jev-writekey-"));
+		const env = { PI_CODING_AGENT_DIR: join(home, "agent") } as NodeJS.ProcessEnv;
+		const or = writeJevKey("sk-or-v1-abcdef123456", "openrouter", env);
+		expect(or.path.endsWith("openrouter.key")).toBe(true);
+		expect(readFileSync(or.path, "utf8")).toBe("sk-or-v1-abcdef123456");
+		expect(or.masked).toBe("sk-or-…3456");
+		expect(writeJevKey("ts-secret", "typesafe", env).path.endsWith("typesafe.key")).toBe(true);
+		expect(writeLegacyKey("sk-or-v1-zzz", env).path.endsWith("openrouter.key")).toBe(true);
+		expect(() => writeJevKey("  ", "typesafe", env)).toThrow("empty API key");
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	test("a gate block merges, and an unknown provider is ignored", () => {
+		const merged = mergeConfig({ gate: { provider: "typesafe", endpoint: "https://gate.example/decide", model: "typesafe/jev-2" } }, DEFAULT_CONFIG);
+		expect(merged.gate).toEqual({ provider: "typesafe", endpoint: "https://gate.example/decide", model: "typesafe/jev-2" });
+		const junk = mergeConfig({ gate: { provider: "nope", endpoint: "not-a-url" } }, DEFAULT_CONFIG);
+		expect(junk.gate).toEqual(DEFAULT_CONFIG.gate);
+		expect(mergeConfig({}, DEFAULT_CONFIG).gate).not.toBe(DEFAULT_CONFIG.gate); // never aliased
 	});
 
 	test("claudeEnv points at the proxy and keeps tool search; claudeSettings maps behavesAs → wire name", () => {

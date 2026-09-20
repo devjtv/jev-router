@@ -16,7 +16,9 @@
  * Install once:  bun add -g github:devjtv/jev-router   (or `bun link` in a clone)
  */
 
-import { askPreflight, askTiers, loadConfig, planRoute, truncatePrompt } from "../extensions/jev-router.ts";
+import * as p from "@clack/prompts";
+import { askPreflight, askTiers, loadConfig, maskKey, planRoute, providerKey, resolveCreds, truncatePrompt, writeJevKey, agentDir, PROVIDER_ENDPOINTS, PROVIDER_KEY_FILES, type GateProvider } from "../extensions/jev-router.ts";
+import { join } from "node:path";
 import {
 	claudeSettingsPath,
 	daemonLogPath,
@@ -190,6 +192,7 @@ function fmtStatus(s: Status): string {
 		tiers?: Record<string, string>;
 		uptimeMs?: number;
 		selectModel?: string;
+		gate?: { provider: string; endpoint: string; key?: string; model: string };
 		requestsSeen?: number;
 		aliasSeen?: boolean;
 	};
@@ -200,6 +203,7 @@ function fmtStatus(s: Status): string {
 	const lines = [
 		`running  pid ${s.pid}  ${s.url}  up ${up}s`,
 		`model    ${info.model}  (${info.enabled ? info.mode : "disabled"}${info.shadow ? ", shadow" : ""})`,
+		`gate     ${info.gate ? `${info.gate.provider} · ${info.gate.key ? info.gate.key : "no key"}` : "?"}`,
 		`tiers    ${tiers}`,
 		`sessions ${Object.keys(info.sessions ?? {}).length}`,
 		`pidfile  ${pidPath()}`,
@@ -300,6 +304,57 @@ switch (cmd) {
 		}
 		break;
 	}
+	case "key": {
+		const cfg = loadConfig();
+		const provider = (opt("--provider") === "typesafe" ? "typesafe" : opt("--provider") === "openrouter" ? "openrouter" : cfg.gate.provider) as GateProvider;
+		const value = rest.filter((a) => !a.startsWith("-") && a !== opt("--provider")).join(" ").trim();
+		if (!value) {
+			// `--provider X` asks about that provider's own sources; the full chain
+			// (including jev-gate, whose key is bound to its own endpoint) answers
+			// the no-flag case.
+			if (opt("--provider") === "typesafe" || opt("--provider") === "openrouter") {
+				const own = providerKey(provider);
+				if (!own) {
+					console.log(`no ${provider} key configured`);
+					console.log(`  jev-router key <api-key> --provider ${provider}`);
+					console.log(`  env: ${provider === "typesafe" ? "TYPESAFE_API_KEY" : "OPENROUTER_API_KEY"}`);
+					console.log(`  or  ${join(agentDir(), ".secrets", PROVIDER_KEY_FILES[provider])}`);
+					process.exit(1);
+				}
+				console.log(`${maskKey(own.key)}  (from ${own.source})`);
+				console.log(`  →  ${PROVIDER_ENDPOINTS[provider]}`);
+				break;
+			}
+			const creds = resolveCreds(process.env, cfg.gate);
+			if (!creds) {
+				console.log(`no key configured for ${provider}`);
+				console.log(`  jev-router key <api-key> [--provider openrouter|typesafe]`);
+				console.log(`  env: ${provider === "typesafe" ? "TYPESAFE_API_KEY" : "OPENROUTER_API_KEY"}`);
+				console.log(`  or ${join(agentDir(), ".secrets", PROVIDER_KEY_FILES[provider])}`);
+				process.exit(1);
+			}
+			console.log(`${maskKey(creds.key)}  →  ${creds.model} at ${creds.url}`);
+			console.log(`replace with: jev-router key <api-key> [--provider openrouter|typesafe]`);
+			break;
+		}
+		const r = writeJevKey(value, provider);
+		console.log(`saved ${r.masked} to ${r.path}`);
+		const check = resolveCreds(process.env, { provider });
+		if (!check) {
+			console.log("  (could not re-read it — check the file permissions)");
+			break;
+		}
+		const s = p.spinner();
+		s.start(`Checking ${provider} with one gate call`);
+		try {
+			const d = await askTiers("fix the typo in the README title", "", cfg, { creds: check, timeoutMs: 8_000 });
+			s.stop(`works — Jev answered "${d.kind === "tier" ? d.tier : d.action}" in ${d.latencyMs}ms via ${new URL(check.url).host}`);
+		} catch (err) {
+			s.stop(`failed: ${err instanceof Error ? err.message : String(err)}`);
+			process.exit(1);
+		}
+		break;
+	}
 	case "models": {
 		const variant = opt("--variant");
 		await modelsCommand({
@@ -363,6 +418,8 @@ switch (cmd) {
 				"                              env block for Claude Code; --write merges into settings.json",
 				"  update                      pull the latest jev-router, reinstall deps, restart the daemon",
 				"  logs [-n N] [-f]            routing log",
+				"  key [<api-key>] [--provider openrouter|typesafe]",
+				"                              show or replace the Jev gate key (verified live)",
 				"  models [query]              search OpenRouter's models (400+, tool-capable marked)",
 				"  models --tier <t> --pick    choose a model + provider variant (:nitro / :floor) for a tier",
 				"  models --tier <t> --set <spec> [--variant nitro|floor]",

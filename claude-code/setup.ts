@@ -12,19 +12,25 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import * as p from "@clack/prompts";
 import {
+	agentDir,
 	askTiers,
 	baseModelId,
 	configPath,
+	PROVIDER_MODELS,
 	loadConfig,
 	maskKey,
 	mergeConfig,
 	planRoute,
+	PROVIDER_ENDPOINTS,
+	PROVIDER_KEY_FILES,
+	providerKey,
 	resolveCreds,
-	writeLegacyKey,
+	writeJevKey,
 	DEFAULT_CONFIG,
+	type GateProvider,
 	type RouterConfig,
 } from "../extensions/jev-router.ts";
 import {
@@ -52,6 +58,7 @@ import {
 
 type Answers = {
 	key?: string;
+	provider: GateProvider;
 	models: Record<string, string>;
 	behavesAs: string;
 	shadow: boolean;
@@ -99,6 +106,7 @@ export function configPatch(a: Answers): Record<string, unknown> {
 		enabled: true,
 		shadow: a.shadow,
 		cacheGuardMode: a.cacheGuardMode,
+		gate: { provider: a.provider },
 		claudeCode: {
 			models: a.models,
 			fallbackModel: a.models.deep ?? DEFAULT_CONFIG.claudeCode.fallbackModel,
@@ -231,28 +239,90 @@ export async function setup(opts: { yes?: boolean } = {}): Promise<void> {
 		"Detected",
 	);
 
-	// ---- 2. key --------------------------------------------------------------
+	// ---- 2. gate provider + key ---------------------------------------------
+	// Re-running setup must never clobber a working key: a key that already
+	// resolves is kept unless the user explicitly replaces it, and the gate
+	// choice defaults to whatever is configured.
+	const currentProvider: GateProvider = cfg.gate.provider;
+	const initialCreds = resolveCreds(process.env, cfg.gate);
+	let provider = currentProvider;
 	let key: string | undefined;
-	if (!creds) {
+	let replacedKey = false;
+
+	if (!yes) {
+		provider = unwrap(
+			await p.select<GateProvider>({
+				message: "Which Jev endpoint should decide the tier?",
+				initialValue: currentProvider,
+				options: [
+					{ value: "openrouter" as const, label: "OpenRouter", hint: `${PROVIDER_ENDPOINTS.openrouter} · get a key at https://openrouter.ai/keys` },
+					{ value: "typesafe" as const, label: "TypeSafe", hint: `${PROVIDER_ENDPOINTS.typesafe} · the vendor's own endpoint` },
+				],
+			}),
+		);
+	}
+
+	/** Does a key already resolve for `p`, from its env var or its key file? */
+	const keyFor = (p: GateProvider): string | undefined => providerKey(p)?.key;
+	const existingKey = keyFor(provider);
+
+	if (!existingKey) {
 		if (yes) {
-			p.log.error("No Jev key. Set OPENROUTER_API_KEY or run setup interactively.");
+			if (provider === "typesafe") {
+				p.log.error("No TypeSafe key. Set TYPESAFE_API_KEY, or run setup interactively.");
+			} else {
+				p.log.error("No Jev key. Set OPENROUTER_API_KEY, or run setup interactively.");
+			}
 			process.exit(2);
 		}
-		p.log.info("Jev is a $0.00003-per-call decision model on OpenRouter. Get a key at https://openrouter.ai/keys");
+		p.log.info(
+			provider === "typesafe"
+				? "Jev is a $0.00003-per-call decision model. Enter your TypeSafe API key."
+				: "Jev is a $0.00003-per-call decision model on OpenRouter. Get a key at https://openrouter.ai/keys",
+		);
 		key = unwrap(
 			await p.password({
-				message: "OpenRouter API key",
-				validate: (v) => (v && v.trim().startsWith("sk-") ? undefined : "keys start with sk-"),
+				message: `${provider === "typesafe" ? "TypeSafe" : "OpenRouter"} API key`,
+				validate: (v) => {
+					const t = (v ?? "").trim();
+					if (!t) return "a key is required";
+					return undefined;
+				},
 			}),
 		).trim();
+		replacedKey = true;
+	} else if (!yes) {
+		// Key already works (or at least exists) — replacement is opt-in, and the
+		// default answer keeps it.
+		const keep = await p.confirm({
+			message: `${provider === "typesafe" ? "TypeSafe" : "OpenRouter"} key found (${maskKey(existingKey)}). Keep it?`,
+			initialValue: true,
+		});
+		if (p.isCancel(keep)) bail(keep);
+		if (!keep) {
+			key = unwrap(await p.password({ message: `New ${provider === "typesafe" ? "TypeSafe" : "OpenRouter"} API key` })).trim();
+			replacedKey = true;
+		}
 	}
-	const activeCreds = key ? { url: "https://openrouter.ai/api/alpha/decisions", key, model: "typesafe/jev-1.13" } : creds!;
+
+	// A provider switch drops the old provider's endpoint/model overrides.
+	const gateForVerify = { provider, endpoint: provider === currentProvider ? cfg.gate.endpoint : undefined, model: provider === currentProvider ? cfg.gate.model : undefined };
+	// If we are keeping the key the chain already resolved, use that creds object
+	// as-is: it carries jev-gate's own endpoint when that is where the key came
+	// from. Otherwise the choice of provider decides the endpoint.
+	const keepingResolved = !key && initialCreds !== undefined && existingKey === initialCreds.key;
+	const platformCreds = {
+		url: process.env.JEV_ENDPOINT ?? gateForVerify.endpoint ?? PROVIDER_ENDPOINTS[provider],
+		key: key ?? existingKey ?? "",
+		model: process.env.JEV_MODEL ?? gateForVerify.model ?? PROVIDER_MODELS[provider],
+	};
+	const activeCreds = keepingResolved ? initialCreds! : platformCreds;
 	{
 		const s = p.spinner();
-		s.start("Checking the key with one gate call");
+		s.start(`Checking the ${provider} key with one gate call`);
 		try {
 			const d = await askTiers("fix the typo in the README title", "", cfg, { creds: activeCreds, timeoutMs: 8_000 });
-			s.stop(`Key works — Jev answered "${d.kind === "tier" ? d.tier : d.action}" in ${d.latencyMs}ms`);
+			s.stop(`Key works — Jev answered "${d.kind === "tier" ? d.tier : d.action}" in ${d.latencyMs}ms via ${new URL(activeCreds.url).host}`);
 		} catch (err) {
 			s.stop(`Key check failed: ${err instanceof Error ? err.message : String(err)}`);
 			if (!yes && !unwrap(await p.confirm({ message: "Continue anyway?", initialValue: false }))) bail(Symbol.for("cancel"));
@@ -326,10 +396,14 @@ export async function setup(opts: { yes?: boolean } = {}): Promise<void> {
 			);
 
 	// ---- 5. write config -----------------------------------------------------
-	const answers: Answers = { key, models, behavesAs, shadow, subagents, cacheGuardMode, writeSettings: true, installService: false };
+	const answers: Answers = { key, provider, models, behavesAs, shadow, subagents, cacheGuardMode, writeSettings: true, installService: false };
 	if (key) {
-		const r = writeLegacyKey(key);
+		const r = writeJevKey(key, provider);
 		p.log.success(`Key saved to ${r.path} (${r.masked})`);
+	} else if (existingKey && !keepingResolved) {
+		p.log.info(`Keeping the ${provider} key at ${join(agentDir(), ".secrets", PROVIDER_KEY_FILES[provider])}`);
+	} else if (existingKey) {
+		p.log.info(`Keeping the key already configured (${maskKey(existingKey)})`);
 	}
 	{
 		const path = configPath();

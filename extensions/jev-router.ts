@@ -211,6 +211,19 @@ export type RouterConfig = {
 	/** preflight verdict action -> tier name, or "keep" to leave the model alone. */
 	route: Record<string, string>;
 	claudeCode: ClaudeCodeConfig;
+	/**
+	 * Which Jev gate to call, and where. The provider picks the default endpoint
+	 * and the key file; `endpoint`/`model` override both when set. Environment
+	 * variables (`OPENROUTER_API_KEY`, `TYPESAFE_API_KEY`, `JEV_ENDPOINT`,
+	 * `JEV_MODEL`) still take precedence for a session.
+	 */
+	gate: {
+		provider: "openrouter" | "typesafe";
+		/** Full decisions URL, when the default is not what you want. */
+		endpoint?: string;
+		/** Decision model id, when the provider serves more than one. */
+		model?: string;
+	};
 };
 
 /** Prefix of the OMP model role dedicated to a tier: `@jev-fast`, `@jev-deep`, … */
@@ -289,6 +302,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
 		escalate_model: "deep",
 		ask_user: "keep",
 	},
+	gate: { provider: "openrouter" },
 	claudeCode: {
 		model: "jev-router",
 		port: 47_131,
@@ -357,6 +371,7 @@ export function mergeConfig(file: unknown, base: RouterConfig = DEFAULT_CONFIG):
 		...base,
 		tiers: { ...base.tiers },
 		route: { ...base.route },
+		gate: { ...base.gate },
 		claudeCode: { ...base.claudeCode, models: { ...base.claudeCode.models }, openRouter: { ...base.claudeCode.openRouter, only: [...base.claudeCode.openRouter.only], ignore: [...base.claudeCode.openRouter.ignore] } },
 	};
 	const src = asObject(file);
@@ -396,6 +411,13 @@ export function mergeConfig(file: unknown, base: RouterConfig = DEFAULT_CONFIG):
 	if (typeof mass === "number" && Number.isFinite(mass) && mass >= 0 && mass <= 1) out.escalateMass = mass;
 	if (typeof src.visionModel === "string") out.visionModel = src.visionModel.trim();
 	num("cacheGuardTokens", 0);
+
+	const gate = asObject(src.gate);
+	if (gate) {
+		if (gate.provider === "openrouter" || gate.provider === "typesafe") out.gate.provider = gate.provider;
+		if (typeof gate.endpoint === "string" && /^https?:\/\//.test(gate.endpoint.trim())) out.gate.endpoint = gate.endpoint.trim();
+		if (typeof gate.model === "string" && gate.model.trim()) out.gate.model = gate.model.trim();
+	}
 
 	const declaredTiers = asObject(src.tiers);
 	if (declaredTiers) {
@@ -840,8 +862,41 @@ export function seedModelRoles(
 
 export type JevCreds = { url: string; key: string; model: string };
 
+export type GateProvider = "openrouter" | "typesafe";
+
 const DEFAULT_ENDPOINT = "https://openrouter.ai/api/alpha/decisions";
 const DEFAULT_MODEL = "typesafe/jev-1.13";
+
+/**
+ * Each provider's decisions endpoint. Verified against the live services:
+ * OpenRouter serves the decision model at its alpha path, TypeSafe at
+ * `/v1/systemone` (its OpenAPI spec lists exactly that one POST route, and the
+ * same `{state, model, questions}` body works for both).
+ */
+export const PROVIDER_ENDPOINTS: Record<GateProvider, string> = {
+	openrouter: DEFAULT_ENDPOINT,
+	typesafe: "https://api.typesafe.ai/v1/systemone",
+};
+
+/**
+ * The decision model's *name* differs per provider: OpenRouter vendors it as
+ * `typesafe/jev-1.13`, TypeSafe's own API calls it `jev-latest` (see its
+ * `GET /v1/models`). Sending one name to the other provider is a 400/404.
+ */
+export const PROVIDER_MODELS: Record<GateProvider, string> = {
+	openrouter: DEFAULT_MODEL,
+	typesafe: "jev-latest",
+};
+
+/** The key file per provider. Separate files, because the endpoint is what the
+ * file is read back *for* — a TypeSafe key in `openrouter.key` would be sent to
+ * OpenRouter. */
+export const PROVIDER_KEY_FILES: Record<GateProvider, string> = {
+	openrouter: "openrouter.key",
+	typesafe: "typesafe.key",
+};
+
+/** Both providers bill for the same decision model, so the id is shared. */
 
 /** `sk-or-v1-abcdef…9f4` — enough to confirm a key without exposing it. */
 export function maskKey(key: string): string {
@@ -853,18 +908,16 @@ export function maskKey(key: string): string {
 export type KeyWriteResult = { path: string; masked: string };
 
 /**
- * Save a key to the OMP-native secret location `resolveCreds` already reads as
- * its last fallback — the same file OMP's own `--api-key` setup writes to. This
- * makes jev-router configurable on its own, with no dependency on jev-gate: set
- * `OPENROUTER_API_KEY`/`TYPESAFE_API_KEY` for a session-only key, or this file
- * for one that persists.
+ * Save a gate key where `resolveCreds` reads it for that provider:
+ * `<agentDir>/.secrets/<provider>.key`, mode 600. Set the provider's environment
+ * variable for a session-only key, or this file for one that persists.
  */
-export function writeLegacyKey(key: string, env: NodeJS.ProcessEnv = process.env): KeyWriteResult {
+export function writeJevKey(key: string, provider: GateProvider = "openrouter", env: NodeJS.ProcessEnv = process.env): KeyWriteResult {
 	const trimmed = key.trim();
 	if (!trimmed) throw new Error("empty API key");
 	const dir = join(agentDir(env), ".secrets");
 	mkdirSync(dir, { recursive: true });
-	const path = join(dir, "openrouter.key");
+	const path = join(dir, PROVIDER_KEY_FILES[provider]);
 	writeFileSync(path, trimmed, { mode: 0o600 });
 	try {
 		chmodSync(path, 0o600); // best effort: some filesystems (FAT, some CI images) ignore modes
@@ -874,34 +927,94 @@ export function writeLegacyKey(key: string, env: NodeJS.ProcessEnv = process.env
 	return { path, masked: maskKey(trimmed) };
 }
 
-export function resolveCreds(env: NodeJS.ProcessEnv = process.env): JevCreds | undefined {
-	const key = env.OPENROUTER_API_KEY ?? env.TYPESAFE_API_KEY ?? env.JEV_API_KEY;
-	if (key) {
-		return env.TYPESAFE_API_KEY && !env.OPENROUTER_API_KEY
-			? { url: env.JEV_ENDPOINT ?? "https://api.typesafe.ai/v1/decisions", key, model: env.JEV_MODEL ?? DEFAULT_MODEL }
-			: { url: env.JEV_ENDPOINT ?? DEFAULT_ENDPOINT, key, model: env.JEV_MODEL ?? DEFAULT_MODEL };
-	}
-	// jev-gate owns the canonical credential file; reading it means one key for both.
+/** The OpenRouter key file, for callers that predate the provider choice. */
+export function writeLegacyKey(key: string, env: NodeJS.ProcessEnv = process.env): KeyWriteResult {
+	return writeJevKey(key, "openrouter", env);
+}
+
+/** Which provider an endpoint belongs to, when we can tell from the host. */
+export function providerOfEndpoint(url: string | undefined): GateProvider | undefined {
+	if (!url) return undefined;
 	try {
-		const cfgPath = join(homedir(), ".jev-gate", "config.json");
+		const host = new URL(url).host;
+		if (host.endsWith("openrouter.ai")) return "openrouter";
+		if (host.endsWith("typesafe.ai")) return "typesafe";
+	} catch {
+		/* not a URL */
+	}
+	return undefined; // a custom gateway: assume it matches whatever was asked
+}
+
+/**
+ * A key for one specific provider, from *its* environment variable or *its* key
+ * file. Deliberately not the full chain: jev-gate's key belongs to the endpoint
+ * in its own config, so reporting it as "the TypeSafe key" would be wrong.
+ */
+export function providerKey(provider: GateProvider, env: NodeJS.ProcessEnv = process.env): { key: string; source: string } | undefined {
+	const fromEnv = provider === "typesafe" ? (env.TYPESAFE_API_KEY ?? env.JEV_API_KEY) : (env.OPENROUTER_API_KEY ?? env.JEV_API_KEY);
+	if (fromEnv) return { key: fromEnv, source: provider === "typesafe" ? "TYPESAFE_API_KEY" : "OPENROUTER_API_KEY" };
+	const path = join(agentDir(env), ".secrets", PROVIDER_KEY_FILES[provider]);
+	try {
+		const key = existsSync(path) ? readFileSync(path, "utf8").trim() : "";
+		if (key) return { key, source: path };
+	} catch {
+		/* fall through */
+	}
+	return undefined;
+}
+
+/**
+ * The gate credential, in this order:
+ *
+ *   1. environment — `OPENROUTER_API_KEY` / `TYPESAFE_API_KEY` / `JEV_API_KEY`,
+ *      which also pick the provider for that session;
+ *   2. jev-gate's `~/.jev-gate/config.json` (one key for both tools);
+ *   3. `<agentDir>/.secrets/<provider>.key`, for the provider in `cfg.gate`.
+ *
+ * The endpoint follows the provider unless `JEV_ENDPOINT` (env) or
+ * `cfg.gate.endpoint` names one; `JEV_MODEL`/`cfg.gate.model` do the same for
+ * the decision model. Keeping the key file per provider matters: the file is
+ * read *for* an endpoint, so a TypeSafe key in `openrouter.key` would be sent
+ * to OpenRouter and fail with a 401 that looks like a bad key.
+ */
+export function resolveCreds(env: NodeJS.ProcessEnv = process.env, gate?: RouterConfig["gate"]): JevCreds | undefined {
+	const configProvider: GateProvider = gate?.provider ?? "openrouter";
+	const urlFor = (provider: GateProvider) => env.JEV_ENDPOINT ?? (provider === configProvider ? gate?.endpoint : undefined) ?? PROVIDER_ENDPOINTS[provider];
+	const modelFor = (provider: GateProvider) => env.JEV_MODEL ?? (provider === configProvider ? gate?.model : undefined) ?? PROVIDER_MODELS[provider];
+	const model = modelFor(configProvider);
+
+	const envKey = env.OPENROUTER_API_KEY ?? env.TYPESAFE_API_KEY ?? env.JEV_API_KEY;
+	if (envKey) {
+		// A TypeSafe key alone means TypeSafe; OpenRouter wins if both are set.
+		const provider: GateProvider = env.TYPESAFE_API_KEY && !env.OPENROUTER_API_KEY ? "typesafe" : "openrouter";
+		return { url: urlFor(provider), key: envKey, model: modelFor(provider) };
+	}
+	// jev-gate owns the canonical credential file; reading it means one key for
+	// both tools. Its key is bound to the endpoint in *its* config though, so it
+	// only answers for that provider — otherwise "use TypeSafe" would keep
+	// calling OpenRouter with an OpenRouter key.
+	try {
+		const cfgPath = env.JEV_GATE_CONFIG ?? join(homedir(), ".jev-gate", "config.json");
 		if (existsSync(cfgPath)) {
 			const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as Record<string, unknown>;
-			if (typeof cfg.apiKey === "string" && cfg.apiKey) {
+			const gateEndpoint = typeof cfg.endpoint === "string" && cfg.endpoint ? cfg.endpoint : undefined;
+			const implied = providerOfEndpoint(gateEndpoint);
+			if (typeof cfg.apiKey === "string" && cfg.apiKey && (implied === undefined || implied === configProvider)) {
 				return {
-					url: typeof cfg.endpoint === "string" && cfg.endpoint ? cfg.endpoint : DEFAULT_ENDPOINT,
+					url: env.JEV_ENDPOINT ?? gateEndpoint ?? urlFor(configProvider),
 					key: cfg.apiKey,
-					model: typeof cfg.model === "string" && cfg.model ? cfg.model : DEFAULT_MODEL,
+					model: env.JEV_MODEL ?? (typeof cfg.model === "string" && cfg.model ? cfg.model : model),
 				};
 			}
 		}
 	} catch {
-		/* fall through to the legacy key file */
+		/* fall through to the key file */
 	}
 	try {
-		const legacy = join(agentDir(env), ".secrets", "openrouter.key");
-		if (existsSync(legacy)) {
-			const legacyKey = readFileSync(legacy, "utf8").trim();
-			if (legacyKey) return { url: DEFAULT_ENDPOINT, key: legacyKey, model: DEFAULT_MODEL };
+		const path = join(agentDir(env), ".secrets", PROVIDER_KEY_FILES[configProvider]);
+		if (existsSync(path)) {
+			const key = readFileSync(path, "utf8").trim();
+			if (key) return { url: urlFor(configProvider), key, model };
 		}
 	} catch {
 		/* no credential */
@@ -986,7 +1099,7 @@ export async function askTiers(
 	cfg: RouterConfig,
 	opts: { creds?: JevCreds; timeoutMs: number; fetchImpl?: typeof fetch; signal?: AbortSignal },
 ): Promise<Decision> {
-	const creds = opts.creds ?? resolveCreds();
+	const creds = opts.creds ?? resolveCreds(process.env, cfg.gate);
 	if (!creds) throw new Error("no Jev credential (set OPENROUTER_API_KEY or run jev-gate key set)");
 	const names = Object.keys(cfg.tiers);
 	if (!names.length) throw new Error("no tiers configured");
@@ -1509,20 +1622,30 @@ export default function jevRouterExtension(pi: ExtensionAPI): void {
 					return;
 				}
 				case "key": {
-					const value = rest.join(" ").trim();
+					// `/jev-router key [<api-key>] [--provider openrouter|typesafe]`
+					const providerFlag = rest.findIndex((a) => a === "--provider");
+					const providerArg = providerFlag >= 0 ? rest[providerFlag + 1] : undefined;
+					if (providerFlag >= 0 && providerArg !== "openrouter" && providerArg !== "typesafe") {
+						say(`--provider must be openrouter or typesafe (got ${JSON.stringify(providerArg ?? "")})`, "error");
+						return;
+					}
+					const chosen: GateProvider = providerArg === "typesafe" || providerArg === "openrouter" ? providerArg : cfg.gate.provider;
+					const value = rest.filter((a, i) => i !== providerFlag && i !== providerFlag + 1).join(" ").trim();
 					if (!value) {
-						const creds = resolveCreds();
+						const creds = resolveCreds(process.env, cfg.gate);
 						say(
 							creds
-								? `key configured: ${maskKey(creds.key)} · ${creds.model} via ${new URL(creds.url).host} — usage: /jev-router key <api-key> to replace it`
-								: "no key configured — usage: /jev-router key <api-key> (from https://openrouter.ai/settings/keys)",
+								? `key configured: ${maskKey(creds.key)} · ${creds.model} via ${new URL(creds.url).host} (gate provider: ${cfg.gate.provider}) — /jev-router key <api-key> [--provider ${cfg.gate.provider}] to replace it`
+								: `no key configured — /jev-router key <api-key> [--provider openrouter|typesafe] (openrouter keys: https://openrouter.ai/settings/keys)`,
 							creds ? "info" : "warning",
 						);
 						return;
 					}
 					try {
-						const { path, masked } = writeLegacyKey(value);
-						say(`saved ${masked} to ${path}`);
+						const { path, masked } = writeJevKey(value, chosen);
+						// A key saved for a provider the config does not use would sit
+						// unread, so say which provider it belongs to.
+						say(`saved ${masked} for ${chosen} to ${path}${chosen === cfg.gate.provider ? "" : ` — set your gate provider to ${chosen} to use it (gate: { "provider": "${chosen}" })`}`);
 					} catch (err) {
 						say(`could not save key: ${err instanceof Error ? err.message : String(err)}`, "error");
 					}
@@ -1650,7 +1773,7 @@ export default function jevRouterExtension(pi: ExtensionAPI): void {
 					return;
 				}
 				default: {
-					const creds = resolveCreds();
+					const creds = resolveCreds(process.env, cfg.gate);
 					const last = stateFor(ctx).last;
 					const lines = [
 						`enabled=${cfg.enabled} mode=${cfg.mode} pick=${cfg.pick} fallback=${cfg.fallbackTier}`,

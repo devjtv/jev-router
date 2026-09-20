@@ -37,9 +37,11 @@ Restart OMP (or `/reload`) after installing, then check `/jev-router status`.
 
 A Jev credential is required and is looked up in this order:
 `OPENROUTER_API_KEY` / `TYPESAFE_API_KEY` / `JEV_API_KEY` → `~/.jev-gate/config.json`
-→ `~/.omp/agent/.secrets/openrouter.key`. If you already run
+→ `~/.omp/agent/.secrets/<provider>.key` (`openrouter.key` or `typesafe.key`) —
+see [Which Jev endpoint](#which-jev-endpoint) for the provider choice, the two
+endpoint URLs, and why the key file is per provider. If you already run
 [jev-gate](https://github.com/devjtv/jev-gate), the same key is reused with no
-extra setup.
+extra setup. In OMP: `/jev-router key <api-key> [--provider openrouter|typesafe]`.
 
 ### Let your agent install it
 
@@ -173,6 +175,7 @@ routing or invert your tiers.
 ```jsonc
 {
   "enabled": true,
+  "gate": { "provider": "openrouter" },   // or "typesafe"; see Which Jev endpoint
   "mode": "tiers",              // "tiers" | "preflight"
   "pick": "weighted",           // "weighted" | "uniform" | "first"
   "maxPromptChars": 1500,       // prompt text sent to the gate is truncated here
@@ -335,6 +338,39 @@ a line in the daemon log, once per model. Measured live: Gemini 2.5 Flash drove
 a full Read-tool turn correctly; Qwen3 Coder Flash leaked XML in one turn
 through the provider that served it. If a tier misbehaves, try `:nitro`, a
 different model, or `--pick` another.
+
+### Which Jev endpoint
+
+The gate is a decision model you can reach two ways, and setup asks which:
+
+| provider | endpoint | model name | key from |
+| --- | --- | --- | --- |
+| `openrouter` (default) | `openrouter.ai/api/alpha/decisions` | `typesafe/jev-1.13` | https://openrouter.ai/keys |
+| `typesafe` | `api.typesafe.ai/v1/systemone` | `jev-latest` | your TypeSafe account |
+
+```bash
+jev-router setup                       # asks, and keeps the key you already have
+jev-router key                         # show what is configured, masked
+jev-router key --provider typesafe     # that provider's own key + endpoint
+jev-router key <api-key> --provider typesafe       # save it (checked with a live gate call)
+```
+
+Keys are stored per provider — `.secrets/openrouter.key` and
+`.secrets/typesafe.key` — because the file is read *for* an endpoint: a TypeSafe
+key in the OpenRouter slot would just 401. `TYPESAFE_API_KEY` /
+`OPENROUTER_API_KEY` still win for a session, and a `~/.jev-gate/config.json`
+key is used **only for the provider whose endpoint it names**. Resolution order
+is env → jev-gate → `<agentDir>/.secrets/<provider>.key`; `JEV_ENDPOINT` /
+`JEV_MODEL`, then `gate.endpoint` / `gate.model` in the config, override the
+endpoint and model name (each provider names the same model differently).
+
+Re-running `setup` never overwrites a key that already works: it shows the
+masked key and asks whether to keep it (default: keep).
+
+Measured from one machine, 20 calls each, same prompts: p50 **268 ms on both**
+(OpenRouter p90 316 ms, TypeSafe p90 334 ms; min 240/225 ms) and the *same tier
+on all 20 prompts*. So the choice is about which account you already pay, not
+latency — at least from here.
 
 ### CLI and background service
 

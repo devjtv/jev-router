@@ -33,8 +33,12 @@ import {
 	baseModelId,
 	cacheGuard,
 	configPath,
+	PROVIDER_ENDPOINTS,
+	PROVIDER_MODELS,
 	loadConfig,
+	maskKey,
 	planRoute,
+	resolveCreds,
 	truncatePrompt,
 	type Decision,
 	type RouterConfig,
@@ -495,6 +499,10 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 				tiers: Object.fromEntries(Object.keys(cfg.tiers).map((t) => [t, tierModel(t, cfg)])),
 				fallbackModel: cc.fallbackModel,
 				selectModel: baseModelId(cc.behavesAs),
+				gate: (() => {
+					const creds = resolveCreds(process.env, cfg.gate);
+					return { provider: cfg.gate.provider, endpoint: creds?.url ?? PROVIDER_ENDPOINTS[cfg.gate.provider], key: creds ? maskKey(creds.key) : undefined, model: creds?.model ?? PROVIDER_MODELS[cfg.gate.provider] };
+				})(),
 				openRouter: {
 					upstream: cc.openRouterUpstream,
 					key: orKey !== undefined,

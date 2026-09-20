@@ -144,6 +144,7 @@ describe("setup config patch", () => {
 	test("merges onto an existing file, keeping unknown keys and nested claudeCode entries", () => {
 		const existing = JSON.stringify({ log: true, tiers: { fast: { candidates: [] } }, claudeCode: { port: 5000, models: { fast: "x" } } });
 		const patch = configPatch({
+			provider: "openrouter",
 			models: { fast: "claude-haiku-4-5", deep: "claude-opus-5" },
 			behavesAs: "claude-opus-5",
 			shadow: true,
