@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../extensions/jev-router.ts";
-import { chainedStatusLine, mergeClaudeSettings, readPidFile, renderStatusLine, serviceDefinition, statusLineSetting, writePidFile, BIN } from "../claude-code/proxy/daemon.ts";
+import { auditBins, chainedStatusLine, expectedBins, mergeClaudeSettings, readPidFile, renderStatusLine, serviceDefinition, statusLineSetting, writePidFile, BIN } from "../claude-code/proxy/daemon.ts";
 import { configPatch, patchConfigText } from "../claude-code/setup.ts";
 import { claudeEnv, claudeSettings } from "../claude-code/proxy/server.ts";
 
@@ -86,6 +86,27 @@ describe("CLI dispatch", () => {
 		const commands = listed.filter((c) => cases.includes(c) || c.startsWith("-") || c === "help");
 		expect(cases.length).toBeGreaterThan(10);
 		for (const c of cases) expect(commands).toContain(c);
+	});
+});
+
+describe("update self-check", () => {
+	test("expectedBins reads the package's own bin map, so a new name is covered automatically", () => {
+		const bins = expectedBins();
+		expect(bins).toContain("jev-router");
+		expect(bins).toContain("jevr"); // the name a stale install failed to register
+		const pkg = JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf8")) as { bin: Record<string, string> };
+		expect(bins.sort()).toEqual(Object.keys(pkg.bin).sort());
+	});
+
+	test("auditBins separates 'not installed' from 'installed but not on PATH'", () => {
+		const dir = mkdtempSync(join(tmpdir(), "jev-bins-"));
+		// Nothing there yet: both are missing shims.
+		expect(auditBins(["a", "b"], { dir, onPath: () => true })).toEqual({ notInstalled: ["a", "b"], notOnPath: [] });
+		// A shim exists but is not on PATH: a different, cheaper diagnosis.
+		writeFileSync(join(dir, process.platform === "win32" ? "a.exe" : "a"), "");
+		expect(auditBins(["a", "b"], { dir, onPath: () => false })).toEqual({ notInstalled: ["b"], notOnPath: ["a"] });
+		expect(auditBins(["a"], { dir, onPath: () => true })).toEqual({ notInstalled: [], notOnPath: [] });
+		rmSync(dir, { recursive: true, force: true });
 	});
 });
 

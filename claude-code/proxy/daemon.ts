@@ -345,10 +345,51 @@ export function statusLineSetting(bun: string = process.execPath, bin: string = 
 export const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 const REPO_SPEC = "github:devjtv/jev-router";
 
+/** Where bun puts global command shims. */
+export function bunBinDir(): string {
+	return join(homedir(), ".bun", "bin");
+}
+
+/**
+ * The command names this package installs, read from its own `package.json` so
+ * a new `bin` entry is verified without touching this list.
+ */
+export function expectedBins(): string[] {
+	try {
+		const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")) as { bin?: unknown };
+		if (typeof pkg.bin === "string") return [pkg.bin];
+		if (pkg.bin && typeof pkg.bin === "object") {
+			const names = Object.keys(pkg.bin as Record<string, string>);
+			if (names.length) return names;
+		}
+	} catch {
+		/* fall through */
+	}
+	return ["jev-router"];
+}
+
+/**
+ * Which commands are missing a shim, and which have one that is not on PATH.
+ * Separate cases: the first needs a reinstall, the second only a PATH line.
+ */
+export function auditBins(
+	names: readonly string[],
+	opts: { dir?: string; onPath?: (name: string) => boolean } = {},
+): { notInstalled: string[]; notOnPath: string[] } {
+	const dir = opts.dir ?? bunBinDir();
+	const onPath = opts.onPath ?? ((name: string) => Boolean(Bun.which(name)));
+	const shim = (name: string) => join(dir, process.platform === "win32" ? `${name}.exe` : name);
+	return {
+		notInstalled: names.filter((name) => !existsSync(shim(name))),
+		notOnPath: names.filter((name) => existsSync(shim(name)) && !onPath(name)),
+	};
+}
+
 /**
  * Bring this install up to date. A git checkout (`bun link` or a clone) gets a
  * fast-forward pull; a `bun add -g` install is re-added. Either way the deps are
- * reinstalled and a running daemon is restarted so the new code serves.
+ * reinstalled, the install is re-registered with bun, and a running daemon is
+ * restarted so the new code serves.
  */
 export async function update(): Promise<{ ok: boolean; lines: string[] }> {
 	const lines: string[] = [];
@@ -375,14 +416,39 @@ export async function update(): Promise<{ ok: boolean; lines: string[] }> {
 		}
 		const deps = run([process.execPath, "install"], REPO_ROOT);
 		lines.push(`bun install → ${deps.ok ? "ok" : deps.out}`);
+		// A `bin` entry added in a newer version only exists once the install is
+		// re-registered, and `git pull` + `bun install` does not do that. Without
+		// this, the old commands keep working from their old shims while a newly
+		// added one is just "command not found" (seen on macOS with `jevr`).
+		const link = run([process.execPath, "link"], REPO_ROOT);
+		lines.push(`bun link → ${link.ok ? "ok" : link.out}`);
 	} else {
-		const add = run([process.execPath, "add", "-g", REPO_SPEC]);
+		// Run from a neutral directory: this replaces the tree this process was
+		// started from.
+		const add = run([process.execPath, "add", "-g", REPO_SPEC], homedir());
 		lines.push(`bun add -g ${REPO_SPEC} → ${add.ok ? "ok" : add.out}`);
 		if (!add.ok) return { ok: false, lines };
 	}
-	const s = await status();
+
+	const names = expectedBins();
+	let audit = auditBins(names);
+	if (audit.notInstalled.length) {
+		lines.push(`warning: no command found for ${audit.notInstalled.join(", ")} — re-registering`);
+		const repair = isGit ? run([process.execPath, "link"], REPO_ROOT) : run([process.execPath, "add", "-g", REPO_SPEC], homedir());
+		lines.push(`repair → ${repair.ok ? "ok" : repair.out}`);
+		audit = auditBins(names);
+	}
+	if (audit.notInstalled.length) {
+		lines.push(`could not install ${audit.notInstalled.join(", ")}; run \`bun add -g ${REPO_SPEC}\` by hand`);
+		return { ok: false, lines };
+	}
+	if (audit.notOnPath.length) {
+		lines.push(`${audit.notOnPath.join(", ")} installed in ${bunBinDir()} but not on PATH — add: export PATH="$HOME/.bun/bin:$PATH"`);
+	}
+	lines.push(`commands: ${names.join(", ")}`);
+	const s = await status({ port: loadConfig().claudeCode.port });
 	if (s.running) {
-		await stop();
+		await stop({ port: loadConfig().claudeCode.port });
 		const again = await start();
 		lines.push(again.running ? `daemon restarted on ${again.url}` : `daemon did not come back: ${again.reason}`);
 		if (!again.running) return { ok: false, lines };
