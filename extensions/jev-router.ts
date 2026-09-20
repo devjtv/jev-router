@@ -81,6 +81,39 @@ export type Tier = {
 	candidates: Candidate[];
 };
 
+/** How Claude Code subagent requests (those carrying `x-claude-code-agent-id`) are handled by the proxy. */
+export type SubagentPolicy = "route" | "inherit" | "fallback";
+
+/**
+ * Settings for the Claude Code gateway model (`claude-code/proxy`). Claude Code
+ * cannot switch models from a hook, so the proxy presents itself as one model
+ * and picks the real one per user turn when the request arrives.
+ */
+export type ClaudeCodeConfig = {
+	/** Model name Claude Code shows in `/model` and sends on the wire. */
+	model: string;
+	/** Loopback port the proxy listens on. 0 picks a free one. */
+	port: number;
+	/** Where routed requests go: the Anthropic API or another gateway. */
+	upstream: string;
+	/** tier -> model id the upstream accepts. Missing tiers derive from the tier's `anthropic/…` candidate, else `fallbackModel`. */
+	models: Record<string, string>;
+	/** Model when the gate is degraded, the tier is unmapped, or the request carries images under `onImages: "skip"`. */
+	fallbackModel: string;
+	/** Apply the candidate's effort as `output_config.effort`. */
+	effort: boolean;
+	/** Drop prior assistant `thinking` blocks when a turn changes model, so another model's signatures are never replayed. */
+	stripThinkingOnSwitch: boolean;
+	/** `route`: each subagent routes on its own prompt; `inherit`: use the parent session's model; `fallback`: always `fallbackModel`. */
+	subagents: SubagentPolicy;
+	/**
+	 * Requests with `max_tokens` at or below this are Claude Code housekeeping
+	 * (session titles, summaries), not turns: they go to the first (cheapest)
+	 * tier's model without a gate call and never touch the session's pin.
+	 */
+	backgroundMaxTokens: number;
+};
+
 export type RouterConfig = {
 	enabled: boolean;
 	mode: Mode;
@@ -117,6 +150,7 @@ export type RouterConfig = {
 	tiers: Record<string, Tier>;
 	/** preflight verdict action -> tier name, or "keep" to leave the model alone. */
 	route: Record<string, string>;
+	claudeCode: ClaudeCodeConfig;
 };
 
 /** Prefix of the OMP model role dedicated to a tier: `@jev-fast`, `@jev-deep`, … */
@@ -187,6 +221,18 @@ export const DEFAULT_CONFIG: RouterConfig = {
 		escalate_model: "deep",
 		ask_user: "keep",
 	},
+	claudeCode: {
+		model: "jev-router",
+		port: 47_131,
+		upstream: "https://api.anthropic.com",
+		// Overridable per tier. Anything the upstream accepts is valid here.
+		models: { fast: "claude-haiku-4-5", standard: "claude-sonnet-4-6", deep: "claude-opus-5" },
+		fallbackModel: "claude-opus-5",
+		effort: true,
+		stripThinkingOnSwitch: true,
+		subagents: "route",
+		backgroundMaxTokens: 1_024,
+	},
 };
 
 /** Agent directory: `PI_CODING_AGENT_DIR`, else `~/.omp/agent`. */
@@ -235,7 +281,12 @@ function candidateSpecs(raw: unknown): string[] {
  * per key so a user can override one tier without restating the rest.
  */
 export function mergeConfig(file: unknown, base: RouterConfig = DEFAULT_CONFIG): RouterConfig {
-	const out: RouterConfig = { ...base, tiers: { ...base.tiers }, route: { ...base.route } };
+	const out: RouterConfig = {
+		...base,
+		tiers: { ...base.tiers },
+		route: { ...base.route },
+		claudeCode: { ...base.claudeCode, models: { ...base.claudeCode.models } },
+	};
 	const src = asObject(file);
 	if (!src) return out;
 
@@ -308,6 +359,26 @@ export function mergeConfig(file: unknown, base: RouterConfig = DEFAULT_CONFIG):
 	if (declaredRoutes) {
 		for (const [action, tier] of Object.entries(declaredRoutes)) {
 			if (typeof tier === "string" && tier.trim()) out.route[action] = tier.trim();
+		}
+	}
+
+	const cc = asObject(src.claudeCode);
+	if (cc) {
+		const c = out.claudeCode;
+		if (typeof cc.model === "string" && cc.model.trim()) c.model = cc.model.trim();
+		if (typeof cc.port === "number" && Number.isInteger(cc.port) && cc.port >= 0 && cc.port <= 65_535) c.port = cc.port;
+		if (typeof cc.upstream === "string" && /^https?:\/\//.test(cc.upstream.trim())) c.upstream = cc.upstream.trim().replace(/\/+$/, "");
+		if (typeof cc.fallbackModel === "string" && cc.fallbackModel.trim()) c.fallbackModel = cc.fallbackModel.trim();
+		if (typeof cc.effort === "boolean") c.effort = cc.effort;
+		if (typeof cc.stripThinkingOnSwitch === "boolean") c.stripThinkingOnSwitch = cc.stripThinkingOnSwitch;
+		if (cc.subagents === "route" || cc.subagents === "inherit" || cc.subagents === "fallback") c.subagents = cc.subagents;
+		if (typeof cc.backgroundMaxTokens === "number" && Number.isFinite(cc.backgroundMaxTokens) && cc.backgroundMaxTokens >= 0)
+			c.backgroundMaxTokens = cc.backgroundMaxTokens;
+		const models = asObject(cc.models);
+		if (models) {
+			for (const [tier, id] of Object.entries(models)) {
+				if (typeof id === "string" && id.trim()) c.models[tier] = id.trim();
+			}
 		}
 	}
 	return out;
@@ -967,7 +1038,8 @@ export function summarizeLog(lines: readonly string[]): StatsReport {
 		}
 		const event = entry.event;
 		if (event !== "route") {
-			if (event) report.errors++;
+			// Informational lines from the Claude Code proxy are not failures.
+			if (event && event !== "background" && event !== "compat") report.errors++;
 			continue;
 		}
 		report.decisions++;

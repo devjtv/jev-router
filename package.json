@@ -12,7 +12,10 @@
     "live": "bun test/live.ts",
     "live:preflight": "bun test/live.ts preflight",
     "typecheck": "tsc --noEmit",
-    "install:extension": "bun scripts/install.ts"
+    "install:extension": "bun scripts/install.ts",
+    "cc": "bun claude-code/launch.ts",
+    "cc:proxy": "bun claude-code/proxy/server.ts",
+    "cc:env": "bun claude-code/launch.ts --env"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",

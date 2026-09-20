@@ -41,6 +41,21 @@ A Jev credential is required and is looked up in this order:
 [jev-gate](https://github.com/devjtv/jev-gate), the same key is reused with no
 extra setup.
 
+### Let your agent install it
+
+Paste this into OMP, Claude Code, or any coding agent with a shell — it clones
+the repo, installs, seeds the roles, and verifies, asking only for the key:
+
+```
+Install jev-router (https://github.com/devjtv/jev-router) for me. Steps: (1) git clone it to ~/.jev-router (git pull if it exists) and run `bun install` there; (2) run `bun scripts/install.ts` in it, which writes the OMP extension shim to ~/.omp/agent/extensions/jev-router.ts; (3) if none of OPENROUTER_API_KEY / TYPESAFE_API_KEY / JEV_API_KEY is set and neither ~/.jev-gate/config.json nor ~/.omp/agent/.secrets/openrouter.key exists, ask me for an OpenRouter API key and save it with `/jev-router key <key>` in OMP or by writing it to ~/.omp/agent/.secrets/openrouter.key with mode 600; (4) run `bun test` in the repo and report the result; (5) tell me to run `/reload` in OMP, then `/jev-router roles seed` and `/jev-router status`. Do not edit ~/.omp/agent/config.yml yourself; the seed command does that and shows a diff first with --dry-run.
+```
+
+For Claude Code (the gateway model, see [below](#claude-code)):
+
+```
+Set up the jev-router gateway model for Claude Code (https://github.com/devjtv/jev-router). Steps: (1) git clone it to ~/.jev-router (git pull if it exists) and run `bun install` there; (2) make sure a Jev key is available: one of OPENROUTER_API_KEY / TYPESAFE_API_KEY / JEV_API_KEY in the environment, or ~/.jev-gate/config.json, or ~/.omp/agent/.secrets/openrouter.key (mode 600) — ask me for an OpenRouter key if none exists; (3) run `bun test test/claude-code-proxy.test.ts` in the repo and report the result; (4) run `bun claude-code/launch.ts --env` and show me the printed env block; (5) tell me how to start it: `bun ~/.jev-router/claude-code/launch.ts` launches Claude Code on the `jev-router` model with the proxy alive for the session, or add a shell alias for it. Do not change ~/.claude/settings.json unless I ask; the launcher passes the env itself.
+```
+
 ## Two decision modes
 
 | mode | question asked | needs |
@@ -229,7 +244,7 @@ Environment overrides: `JEV_ROUTER_CONFIG`, `JEV_ROUTER_LOG`,
 ## Verifying
 
 ```bash
-bun test              # 79 tests: config merge, guards, tier/role mapping, YAML seeding, CC hook
+bun test              # 119 tests: config merge, guards, tier/role mapping, YAML seeding, CC hook, CC gateway proxy
 bun test/live.ts      # real Jev calls + a stub host: proves setModel/setThinkingLevel fire,
                       # and that each guard holds when the route is real
 bun test/live.ts preflight
@@ -260,35 +275,75 @@ ok multi-file   jev=deep      deep → @task (high)        266ms
 
 ## Claude Code
 
-`claude-code/` is a second, separate plugin for Claude Code, and it does a
-different job — because Claude Code gives a plugin a different ceiling:
+`claude-code/` routes Claude Code too, but not from a hook — a Claude Code hook
+cannot switch the model (`PreModelSwitch` can only `allow`/`ask`/`deny` a switch
+someone else requested). What Claude Code *does* give you is a gateway: it sends
+every request to `ANTHROPIC_BASE_URL`, passes any model name through unchecked,
+and `ANTHROPIC_CUSTOM_MODEL_OPTION` puts that name in the `/model` picker. So
+`claude-code/proxy` **is a model called `jev-router`**. Select it and every user
+turn is gated by Jev and forwarded to the real model for its tier:
 
-- **A Claude Code hook cannot switch the model.** `PreModelSwitch` can `allow`,
-  `ask`, or `deny` a switch that someone else requested; the docs state that
-  `set_model` requests come from "an Agent SDK host or Remote Control". So
-  per-prompt routing, the entire point of the OMP extension, **is not possible
-  in a Claude Code plugin**. It is not attempted here and it is not faked.
-- What *is* native is the cost problem: `PreModelSwitch` fires before a switch
-  and hands over `context_tokens` and `prompt_cache_warm`. That is exactly the
-  guard in batch A above, so the plugin implements it as a rules-only hook
-  (zero latency, no gate call), reading the same `jev-router.json` thresholds.
-
-```bash
-claude --plugin-dir C:/Users/jakey/Repos/jev-router/claude-code
-# or: claude plugin marketplace add C:/Users/jakey/Repos/jev-router/claude-code
+```
+claude ──▶ 127.0.0.1:47131 (model: jev-router) ──▶ jev: which tier? ──▶ rewrite model + effort ──▶ api.anthropic.com
+                                                    ~0.3s, once per user turn
 ```
 
-```json
-{
-  "systemMessage": "jev-router: 212,431 tokens in context will be re-sent to claude-opus-5 uncached.",
-  "hookSpecificOutput": { "hookEventName": "PreModelSwitch", "permissionDecision": "allow" }
+```bash
+bun claude-code/launch.ts                 # starts the proxy, runs `claude --model jev-router`, stops it when claude exits
+bun claude-code/launch.ts -p "fix the typo in the README title"
+bun claude-code/launch.ts --env           # print the env block if you'd rather run the proxy yourself
+bun claude-code/proxy/server.ts           # the proxy alone, with the env it needs printed to stderr
+```
+
+Your claude.ai login keeps working: with only `ANTHROPIC_BASE_URL` set, Claude
+Code still authenticates with the saved OAuth session and the proxy forwards
+`anthropic-beta` and `Authorization` verbatim, so billing and limits are unchanged.
+
+Being at the request layer gives the proxy control the OMP extension does not have:
+
+- **A turn is pinned.** The gate runs once on the user's prompt; every request
+  inside that turn (after each tool call) goes to the same model, so thinking
+  signatures and the prompt cache hold. Retries of the same turn are not re-routed.
+- **Subagents are visible** (`x-claude-code-agent-id`): `claudeCode.subagents`
+  is `route` (own prompt), `inherit` (parent's model) or `fallback`.
+- **Context size is exact.** The cache guard reads `usage` off the upstream
+  response instead of estimating; above `cacheGuardTokens` only `output_config.effort` changes.
+- **Housekeeping is cheap.** Title and summary requests carry no tools; they go
+  to the first tier's model with no gate call and never disturb the turn's pin.
+- **Nothing else is touched.** Requests for any other model name — Claude Code's
+  background Haiku traffic, a subagent with its own `model:` — pass through byte-for-byte.
+- **Field compatibility is learned.** If a routed model rejects
+  `output_config.effort`, adaptive `thinking`, or a `clear_thinking` context edit
+  with a 400, the proxy strips that field, retries once, and pre-strips it for
+  that model from then on. Verified live: Haiku 4.5 rejects the first two.
+
+Configuration lives under `claudeCode` in the same `jev-router.json`:
+
+```jsonc
+"claudeCode": {
+  "model": "jev-router",                 // the picker entry and wire name
+  "port": 47131,
+  "upstream": "https://api.anthropic.com",
+  "models": { "fast": "claude-haiku-4-5", "standard": "claude-sonnet-4-6", "deep": "claude-opus-5" },
+  "fallbackModel": "claude-opus-5",      // gate down, image turn under onImages: "skip", proxy restarted mid-turn
+  "effort": true,                        // apply the candidate's effort as output_config.effort
+  "stripThinkingOnSwitch": true,         // drop prior thinking blocks when the model changes between turns
+  "subagents": "route",                  // "route" | "inherit" | "fallback"
+  "backgroundMaxTokens": 1024            // requests at or below this max_tokens are housekeeping
 }
 ```
 
-Default is to **report, not veto** — a switch the user asked for is the user's
-call, and the useful contribution is the price. `cacheGuardMode: "keep"` denies
-above the threshold instead, and `JEV_ROUTER_CC=allow|ask|deny` forces the
-action. See [claude-code/README.md](./claude-code/README.md).
+A tier without a `models` entry derives its id from an `anthropic/<id>` candidate
+in the OMP config; everything else (`mode`, tier rubrics, `pick`, the guards,
+`shadow`, the log) is shared with the OMP extension, and `/jev-router stats` in
+OMP reads the proxy's lines too (`"host":"claude-code"`).
+
+The `PreModelSwitch` hook plugin is still there for the case it fits — a manual
+`/model` switch on a warm cache — and reports what the switch re-sends. See
+[claude-code/README.md](./claude-code/README.md) for both, including the live
+run and its rough edges (Claude Code warns once that `jev-router` is not in
+its model catalog and assumes a 200k window; `/cost` bills the alias at an
+unknown rate).
 
 ## Honest caveats
 
@@ -331,7 +386,11 @@ types/pi-coding-agent.d.ts ambient host types — the host package is not a depe
 test/router.test.ts        pure-logic tests (no network): config, guards, roles, stats
 test/live.ts               live gate + stub-host wiring + guard cases + stats command
 test/claude-code-hook.test.ts  spawns the Claude Code hook as the host does
-claude-code/               the Claude Code plugin (PreModelSwitch cache guard) + its README
+test/claude-code-proxy.test.ts the gateway model against a stub upstream: pinning, guards, compat retries, subagents
+claude-code/proxy/routing.ts   pure request shaping: turn detection, prompt text, tier -> model, field stripping
+claude-code/proxy/server.ts    the gateway model (Bun.serve): per-turn routing, streaming relay, usage tracking
+claude-code/launch.ts          start the proxy and run `claude --model jev-router` on it
+claude-code/hooks/             the PreModelSwitch cache-guard plugin
 scripts/install.ts         writes the shim into the native extension directory
 .omp-plugin/marketplace.json  OMP marketplace catalog (plugin source = this repo root)
 ```
