@@ -38,7 +38,8 @@ jev-router setup                          # guided onboarding; --yes for default
 
 `setup` walks: detect (bun, claude, key, daemon) → OpenRouter key, verified with
 one real Jev call → a model per tier (fast / standard / deep / planner) → what
-Claude Code should believe it runs (Opus 5, 200k or 1M) → shadow mode, subagent
+Claude Code should believe it runs (Opus 5 / Sonnet 4.6 / Fable 5.1 — always a bare
+id; pick the 1M row in `/model` afterwards, which the override still matches) → shadow mode, subagent
 policy, cache guard → writes `jev-router.json` (merge) → starts the daemon →
 optional login service → wires `settings.json` (merge, backup) → **status bar
 choice**: if you already have a `statusLine`, keep yours with the jev line
@@ -174,6 +175,24 @@ the cache guard used to fire on a session's first turn from a size estimate
 alone, pinning Opus — there is no cache to protect on a first turn, so it no
 longer does. Remaining rough edge: `/cost` bills the alias at Opus rates
 regardless of the tier that ran; use `jev-router logs` or `/jev-router stats`.
+
+**Third live pass — the `[1m]` silent-unrouted bug.** `[1m]` is a *request-time*
+modifier Claude Code appends after resolving a model id (it also brings the
+`context-1m-*` beta, which is why the compat layer strips that beta per model).
+It is not part of the id, so a `modelOverrides` key of `claude-opus-5[1m]`
+matches nothing: Claude Code then puts a name the proxy does not answer to on the
+wire, `body.model !== cc.model` sends the turn to passthrough, and **nothing is
+routed — with no error from either side**. Measured: select `claude-opus-5[1m]`
+with the override keyed `claude-opus-5` → routed (`fast → claude-haiku-4-5`,
+answer correct); key it `claude-opus-5[1m]` → zero routing and, before this fix,
+zero signal. Three changes: `baseModelId()` normalizes `behavesAs` on read (old
+configs self-heal), `claudeSettings()` emits the base key and base `model`
+whatever the config says, and the proxy compares the incoming model on its base
+id so a `jev-router[1m]` wire name still routes instead of falling through. The
+silence is now a warning: after 5 requests with none for the alias, the daemon
+logs `alias_never_seen` and `jev-router status` prints what to select. `status`
+also says when routing is switched off (`"enabled": false`), which is invisible
+for the same reason.
 
 ### Config
 

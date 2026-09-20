@@ -30,7 +30,9 @@ import {
 	appendLog,
 	askPreflight,
 	askTiers,
+	baseModelId,
 	cacheGuard,
+	configPath,
 	loadConfig,
 	planRoute,
 	truncatePrompt,
@@ -146,6 +148,16 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 	const quirks = new Map<string, Set<CompatField>>();
 	/** `JEV_ROUTER_DEBUG=1` also logs requests the proxy does not touch. */
 	const debug = process.env.JEV_ROUTER_DEBUG === "1";
+	/**
+	 * Gate on "did the alias ever show up". A wrong `modelOverrides` key (say a
+	 * `[1m]` suffix) makes Claude Code send a model name this proxy never
+	 * matches, and routing then does nothing at all — with no error from either
+	 * side. Counting turns that silence into a warning is the only defence.
+	 */
+	let requestsSeen = 0;
+	let aliasSeen = false;
+	let warnedNoAlias = false;
+	const ALIAS_WARN_AFTER = 5;
 	let gateWarned = false;
 
 	const decide =
@@ -390,6 +402,9 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 				shadow: cfg.shadow,
 				tiers: Object.fromEntries(Object.keys(cfg.tiers).map((t) => [t, tierModel(t, cfg)])),
 				fallbackModel: cc.fallbackModel,
+				selectModel: baseModelId(cc.behavesAs),
+				requestsSeen,
+				aliasSeen,
 				sessions: Object.fromEntries(sessions),
 				quirks: Object.fromEntries([...quirks].map(([m, s]) => [m, [...s]])),
 			});
@@ -411,10 +426,25 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 			if (debug) log({ event: "unparsed", host: "claude-code", bytes: raw.length, head: raw.slice(0, 60), encoding: req.headers.get("content-encoding") ?? undefined });
 			return passthroughRaw(req, url, raw);
 		}
-		if (body.model !== cc.model) {
+		requestsSeen++;
+		// Compare on the base id: a trailing `[1m]` (or any modifier) is applied
+		// by Claude Code on top of whatever the override resolved to, so the wire
+		// name can arrive as `jev-router[1m]`. Matching the literal string there
+		// would drop the whole turn into passthrough — routed by nothing, silently.
+		const requested = baseModelId(typeof body.model === "string" ? body.model : "");
+		if (requested !== cc.model) {
 			if (debug) log({ event: "passthrough", host: "claude-code", model: body.model, path: url.pathname, tools: Array.isArray(body.tools) ? body.tools.length : 0 });
+			if (!aliasSeen && !warnedNoAlias && requestsSeen >= ALIAS_WARN_AFTER) {
+				warnedNoAlias = true;
+				const message =
+					`${requestsSeen} requests and none for the gateway model "${cc.model}" — Claude Code is not selecting it, so nothing is being routed. ` +
+					`In /model choose "${baseModelId(cc.behavesAs)}". If you already did, its modelOverrides key is wrong: check "behavesAs" in ${configPath()} (no [1m] or other [modifier] — those are request-time suffixes, not part of the id).`;
+				if (cfg.log) log({ event: "alias_never_seen", host: "claude-code", requests: requestsSeen, saw: body.model, expected: cc.model, message });
+				trace(message);
+			}
 			return passthroughRaw(req, url, raw);
 		}
+		aliasSeen = true;
 
 		const { key, parentKey, agentId } = sessionKey(req.headers);
 		const fingerprint = turnFingerprint(body);
@@ -540,5 +570,9 @@ export function claudeEnv(proxyUrl: string, _cfg: RouterConfig): Record<string, 
 
 export function claudeSettings(cfg: RouterConfig): { modelOverrides: Record<string, string>; model: string } {
 	const cc = cfg.claudeCode;
-	return { modelOverrides: { [cc.behavesAs]: cc.model }, model: cc.behavesAs };
+	// Base id on both sides, always. The override key is what Claude Code
+	// matches, and a `[1m]` there matches nothing; the modifier is applied by
+	// `/model` afterwards, so dropping it here does not cost the 1M window.
+	const base = baseModelId(cc.behavesAs);
+	return { modelOverrides: { [base]: cc.model }, model: base };
 }

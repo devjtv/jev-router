@@ -372,7 +372,7 @@ Configuration lives under `claudeCode` in the same `jev-router.json`:
   "stripThinkingOnSwitch": true,         // drop prior thinking blocks when the model changes between turns
   "subagents": "route",                  // "route" | "inherit" | "fallback"
   "backgroundMaxTokens": 1024,           // requests at or below this max_tokens are housekeeping
-  "behavesAs": "claude-opus-5",          // the real id Claude Code is told it runs; "claude-opus-5[1m]" if your plan has 1M
+  "behavesAs": "claude-opus-5",          // the real id Claude Code is told it runs — bare, never "claude-opus-5[1m]"
   "maxRouteTokens": 150000               // estimated prompt tokens above which a turn goes to fallbackModel unrouted
 }
 ```

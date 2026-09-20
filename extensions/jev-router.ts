@@ -116,7 +116,12 @@ export type ClaudeCodeConfig = {
 	 * The real model id Claude Code is told it is running, via
 	 * `modelOverrides: { [behavesAs]: model }`. Claude Code takes its context
 	 * window, tool-search and capability decisions from this id and puts
-	 * `model` on the wire. Append `[1m]` for the 1M window when your plan has it.
+	 * `model` on the wire.
+	 *
+	 * A bare id only — no `[1m]` or other `[modifier]`. Those are appended by
+	 * Claude Code *after* it resolves an id (from `/model`), so a bracketed key
+	 * matches nothing and every turn silently goes unrouted. Pick the 1M row in
+	 * `/model` instead; the override still matches the base id.
 	 */
 	behavesAs: string;
 	/**
@@ -125,6 +130,21 @@ export type ClaudeCodeConfig = {
 	 */
 	maxRouteTokens: number;
 };
+
+/**
+ * A model id without Claude Code's trailing `[modifier]`
+ * (`claude-opus-5[1m]` → `claude-opus-5`).
+ *
+ * The bracket is a *request-time* modifier Claude Code appends after it has
+ * resolved an id — the 1M window and the matching `context-1m-*` beta follow
+ * from it. It is not part of the id, so it must never reach `modelOverrides`:
+ * an override keyed `claude-opus-5[1m]` matches nothing, Claude Code then sends
+ * the bracketed string on the wire, and the gateway model is never requested —
+ * a silent, total routing failure with no error anywhere.
+ */
+export function baseModelId(id: string): string {
+	return id.trim().replace(/\[[^\]]*\]$/, "");
+}
 
 export type RouterConfig = {
 	enabled: boolean;
@@ -396,7 +416,10 @@ export function mergeConfig(file: unknown, base: RouterConfig = DEFAULT_CONFIG):
 		if (cc.subagents === "route" || cc.subagents === "inherit" || cc.subagents === "fallback") c.subagents = cc.subagents;
 		if (typeof cc.backgroundMaxTokens === "number" && Number.isFinite(cc.backgroundMaxTokens) && cc.backgroundMaxTokens >= 0)
 			c.backgroundMaxTokens = cc.backgroundMaxTokens;
-		if (typeof cc.behavesAs === "string" && cc.behavesAs.trim()) c.behavesAs = cc.behavesAs.trim();
+		// Normalize on read: a `[1m]` a user (or an older setup) wrote into
+		// behavesAs would otherwise key modelOverrides on an id Claude Code never
+		// matches, silently leaving every turn unrouted.
+		if (typeof cc.behavesAs === "string" && baseModelId(cc.behavesAs)) c.behavesAs = baseModelId(cc.behavesAs);
 		if (typeof cc.maxRouteTokens === "number" && Number.isFinite(cc.maxRouteTokens) && cc.maxRouteTokens > 0) c.maxRouteTokens = cc.maxRouteTokens;
 		const models = asObject(cc.models);
 		if (models) {

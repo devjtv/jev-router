@@ -16,6 +16,7 @@ import { dirname } from "node:path";
 import * as p from "@clack/prompts";
 import {
 	askTiers,
+	baseModelId,
 	configPath,
 	loadConfig,
 	maskKey,
@@ -198,8 +199,8 @@ export async function setup(opts: { yes?: boolean } = {}): Promise<void> {
 					message: "What should Claude Code believe it is running? (sets context window + capabilities)",
 					initialValue: cc.behavesAs,
 					options: [
-						{ value: "claude-opus-5", label: "Opus 5 — 200k window", hint: "right for Pro/Team plans" },
-						{ value: "claude-opus-5[1m]", label: "Opus 5 — 1M window", hint: "only if your plan has long context; otherwise every turn 400s" },
+						{ value: "claude-opus-5", label: "Opus 5", hint: "right for Pro/Team plans" },
+						{ value: "claude-sonnet-4-6", label: "Sonnet 4.6", hint: "lighter" },
 						{ value: "claude-fable-5-1", label: "Fable 5.1", hint: "" },
 					],
 				}),
@@ -349,7 +350,8 @@ export async function setup(opts: { yes?: boolean } = {}): Promise<void> {
 		.join("   ");
 	p.note(
 		[
-			`Select "${behavesAs.replace(/\[1m\]$/, "")}" in Claude Code's /model — that is the routed one.`,
+			`Select "${baseModelId(behavesAs)}" in Claude Code's /model — that is the routed one.`,
+			"Add [1m] there (or pick the 1M row) for the 1M window; the override still matches the base id.",
 			`Tiers: ${tiers}`,
 			shadow ? "Shadow mode is ON: routes are logged, not applied. Set \"shadow\": false in the config to go live." : "",
 			"",

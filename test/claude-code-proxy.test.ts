@@ -8,7 +8,9 @@
  */
 
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { DEFAULT_CONFIG, mergeConfig, type Decision, type RouterConfig } from "../extensions/jev-router.ts";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { DEFAULT_CONFIG, baseModelId, mergeConfig, type Decision, type RouterConfig } from "../extensions/jev-router.ts";
 import {
 	apiEffort,
 	applyTarget,
@@ -204,7 +206,26 @@ describe("claudeCode config", () => {
 		expect(env).toEqual({ ANTHROPIC_BASE_URL: "http://127.0.0.1:1", ENABLE_TOOL_SEARCH: "1" });
 		expect(claudeSettings(cfg)).toEqual({ modelOverrides: { "claude-opus-5": "jev-router" }, model: "claude-opus-5" });
 		const oneM = mergeConfig({ claudeCode: { behavesAs: "claude-opus-5[1m]" } }, cfg);
-		expect(claudeSettings(oneM).modelOverrides).toEqual({ "claude-opus-5[1m]": "jev-router" });
+		expect(oneM.claudeCode.behavesAs).toBe("claude-opus-5"); // normalized on read, so old configs self-heal
+		expect(claudeSettings(oneM)).toEqual({ modelOverrides: { "claude-opus-5": "jev-router" }, model: "claude-opus-5" });
+		// Even a config built by hand cannot produce a bracketed key: Claude Code
+		// matches on the bare id, so `claude-opus-5[1m]` would match nothing and
+		// every turn would pass through unrouted with no error.
+		const raw: RouterConfig = { ...cfg, claudeCode: { ...cfg.claudeCode, behavesAs: "claude-opus-5[1m]" } };
+		const emitted = Object.keys(claudeSettings(raw).modelOverrides);
+		expect(emitted).toEqual(["claude-opus-5"]);
+		expect(emitted.some((k) => /\[/.test(k))).toBe(false);
+		expect(claudeSettings(raw).model).toBe("claude-opus-5");
+	});
+
+	test("baseModelId strips only a trailing modifier, and setup offers no bracketed choice", () => {
+		expect(baseModelId("claude-opus-5[1m]")).toBe("claude-opus-5");
+		expect(baseModelId("  claude-opus-5[1m]  ")).toBe("claude-opus-5");
+		expect(baseModelId("claude-opus-5")).toBe("claude-opus-5");
+		expect(baseModelId("claude-opus-5[1m][2m]")).toBe("claude-opus-5[1m]"); // one trailing modifier, not a parser
+		expect(baseModelId("us.anthropic.claude-opus-4-8")).toBe("us.anthropic.claude-opus-4-8");
+		const setupSource = readFileSync(join(import.meta.dir, "..", "claude-code", "setup.ts"), "utf8");
+		expect(setupSource).not.toMatch(/value: "claude-[a-z0-9.-]*\[/);
 	});
 
 	test("stripBetas removes only the 1M beta, only when asked", () => {
@@ -330,6 +351,42 @@ beforeEach(() => {
 });
 
 describe("gateway model", () => {
+	test("warns, once, when nothing ever asks for the gateway model", async () => {
+		const proxy = makeProxy();
+		proxies.push(proxy);
+		// This is what a bracketed modelOverrides key looks like from the proxy's
+		// side: Claude Code requests a name the alias does not answer to.
+		for (let i = 0; i < 6; i++) await post(proxy.url, { model: "claude-opus-5[1m]", max_tokens: 10, messages: [{ role: "user", content: "hi" }] });
+		expect(gateCalls).toBe(0);
+		expect(seen.every((s) => s.body.model === "claude-opus-5[1m]")).toBe(true); // untouched
+		const warnings = logs.filter((l) => l.event === "alias_never_seen");
+		expect(warnings).toHaveLength(1);
+		expect(String(warnings[0]!.message)).toContain("none for the gateway model");
+		expect(String(warnings[0]!.message)).toContain("claude-opus-5"); // names the model to select
+		const status = (await (await fetch(`${proxy.url}/jev-router/status`)).json()) as { requestsSeen: number; aliasSeen: boolean; selectModel: string };
+		expect(status.aliasSeen).toBe(false);
+		expect(status.selectModel).toBe("claude-opus-5");
+
+		// Once the alias is asked for, the warning stops and the flag flips.
+		logs.length = 0;
+		await post(proxy.url, body([user("x")]));
+		expect(logs.filter((l) => l.event === "alias_never_seen")).toHaveLength(0);
+		const after = (await (await fetch(`${proxy.url}/jev-router/status`)).json()) as { aliasSeen: boolean };
+		expect(after.aliasSeen).toBe(true);
+	});
+
+	test("a wire name carrying a modifier still routes (jev-router[1m])", async () => {
+		const proxy = makeProxy();
+		proxies.push(proxy);
+		decisions.a = "fast";
+		const res = await post(proxy.url, body([user("a")], { model: "jev-router[1m]" }));
+		expect(res.status).toBe(200);
+		expect(gateCalls).toBe(1);
+		// Rewritten onto the tier's model, so the modifier never reaches upstream.
+		expect(seen[0]!.body.model).toBe("claude-haiku-4-5");
+		expect(proxy.sessions.get("sess-1")?.tier).toBe("fast");
+	});
+
 	test("requests for other models pass through byte-for-byte, headers included", async () => {
 		const proxy = makeProxy();
 		proxies.push(proxy);

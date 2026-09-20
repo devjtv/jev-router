@@ -49,18 +49,42 @@ const opt = (name: string): string | undefined => {
 
 function fmtStatus(s: Status): string {
 	if (!s.running) return `not running — ${s.reason}`;
-	const info = s.info as { model?: string; mode?: string; enabled?: boolean; shadow?: boolean; sessions?: Record<string, unknown>; tiers?: Record<string, string>; uptimeMs?: number };
+	const info = s.info as {
+		model?: string;
+		mode?: string;
+		enabled?: boolean;
+		shadow?: boolean;
+		sessions?: Record<string, unknown>;
+		tiers?: Record<string, string>;
+		uptimeMs?: number;
+		selectModel?: string;
+		requestsSeen?: number;
+		aliasSeen?: boolean;
+	};
 	const up = Math.round((info.uptimeMs ?? 0) / 1000);
 	const tiers = Object.entries(info.tiers ?? {})
 		.map(([t, m]) => `${t}=${m}`)
 		.join(" ");
-	return [
+	const lines = [
 		`running  pid ${s.pid}  ${s.url}  up ${up}s`,
 		`model    ${info.model}  (${info.enabled ? info.mode : "disabled"}${info.shadow ? ", shadow" : ""})`,
 		`tiers    ${tiers}`,
 		`sessions ${Object.keys(info.sessions ?? {}).length}`,
 		`pidfile  ${pidPath()}`,
-	].join("\n");
+	];
+	// A wrong modelOverrides key means Claude Code never asks for the alias, and
+	// nothing gets routed while both sides look healthy. Say so out loud.
+	if (info.enabled === false) {
+		lines.push(`warning  routing is disabled ("enabled": false) — turns pass through on the fallback model, unrouted.`);
+	}
+	if (info.requestsSeen && info.aliasSeen === false) {
+		lines.push(
+			`warning  ${info.requestsSeen} requests, none for "${info.model}" — nothing is being routed.`,
+			`         In /model choose "${info.selectModel}". If it is already selected, "behavesAs" is wrong:`,
+			"         it must be a bare id (no [1m] or other [modifier]).",
+		);
+	}
+	return lines.join("\n");
 }
 
 switch (cmd) {
