@@ -18,7 +18,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { agentDir, loadConfig, logPath, type RouterConfig } from "../../extensions/jev-router.ts";
-import { claudeEnv, createProxy } from "./server.ts";
+import { claudeEnv, claudeSettings, createProxy } from "./server.ts";
 
 export const BIN = resolve(import.meta.dir, "..", "..", "bin", "jev-router.ts");
 
@@ -91,7 +91,8 @@ export async function serveForeground(opts: { cfg?: RouterConfig; port?: number;
 	writePidFile({ pid: process.pid, port: proxy.port, url: proxy.url, startedAt: new Date().toISOString() });
 	say(`gateway model "${cfg.claudeCode.model}" listening on ${proxy.url} → ${cfg.claudeCode.upstream}`);
 	for (const [k, v] of Object.entries(claudeEnv(proxy.url, cfg))) say(`  ${k}=${v}`);
-	say(`  then: claude --model ${cfg.claudeCode.model}   (or: jev-router claude)`);
+	say(`  settings: ${JSON.stringify(claudeSettings(cfg))}`);
+	say(`  then: claude --model ${cfg.claudeCode.behavesAs}   (or: jev-router claude)`);
 
 	const shutdown = () => {
 		proxy.stop();
@@ -277,14 +278,28 @@ export function claudeSettingsPath(env: NodeJS.ProcessEnv = process.env): string
 }
 
 /**
+ * The `statusLine` entry that shows the current route inside Claude Code.
+ * Paths use forward slashes: Claude Code runs the command through a POSIX-style
+ * shell even on Windows, where `C:\Users\…` would be read as escapes.
+ */
+export function statusLineSetting(bun: string = process.execPath, bin: string = BIN): { type: "command"; command: string } {
+	const q = (s: string) => {
+		const p = s.replace(/\\/g, "/");
+		return /[\s"]/.test(p) ? `"${p.replace(/"/g, '\\"')}"` : p;
+	};
+	return { type: "command", command: `${q(bun)} ${q(bin)} statusline` };
+}
+
+/**
  * Merge the env block into a settings.json text. Pure: returns the new text
- * and what changed. Unknown keys are preserved; only `env` entries we own are
- * written, and `model` is set only when absent so a user's choice is kept.
+ * and what changed. Unknown keys are preserved; only `env` and `modelOverrides`
+ * entries we own are written; `model` and `statusLine` are set only when
+ * absent so a user's own choices are kept.
  */
 export function mergeClaudeSettings(
 	text: string,
 	env: Record<string, string>,
-	model: string,
+	settingsToAdd: { modelOverrides: Record<string, string>; model: string; statusLine?: { type: "command"; command: string } },
 ): { text: string; changed: string[]; error?: string } {
 	let settings: Record<string, unknown> = {};
 	if (text.trim()) {
@@ -296,26 +311,34 @@ export function mergeClaudeSettings(
 			return { text, changed: [], error: `settings.json does not parse: ${err instanceof Error ? err.message : String(err)}` };
 		}
 	}
-	const prevEnv = typeof settings.env === "object" && settings.env !== null ? (settings.env as Record<string, unknown>) : {};
-	const nextEnv: Record<string, unknown> = { ...prevEnv };
 	const changed: string[] = [];
-	for (const [k, v] of Object.entries(env)) {
-		if (nextEnv[k] !== v) {
-			nextEnv[k] = v;
-			changed.push(`env.${k}`);
+	const mergeMap = (key: "env" | "modelOverrides", add: Record<string, string>) => {
+		const prev = typeof settings[key] === "object" && settings[key] !== null ? (settings[key] as Record<string, unknown>) : {};
+		const next: Record<string, unknown> = { ...prev };
+		for (const [k, v] of Object.entries(add)) {
+			if (next[k] !== v) {
+				next[k] = v;
+				changed.push(`${key}.${k}`);
+			}
 		}
-	}
-	settings.env = nextEnv;
+		settings[key] = next;
+	};
+	mergeMap("env", env);
+	mergeMap("modelOverrides", settingsToAdd.modelOverrides);
 	if (settings.model === undefined) {
-		settings.model = model;
+		settings.model = settingsToAdd.model;
 		changed.push("model");
+	}
+	if (settingsToAdd.statusLine && settings.statusLine === undefined) {
+		settings.statusLine = settingsToAdd.statusLine;
+		changed.push("statusLine");
 	}
 	return { text: `${JSON.stringify(settings, null, 2)}\n`, changed };
 }
 
 export function writeClaudeSettings(cfg: RouterConfig, proxyUrl: string, path: string = claudeSettingsPath()): { path: string; changed: string[]; error?: string } {
 	const current = existsSync(path) ? readFileSync(path, "utf8") : "";
-	const merged = mergeClaudeSettings(current, claudeEnv(proxyUrl, cfg), cfg.claudeCode.model);
+	const merged = mergeClaudeSettings(current, claudeEnv(proxyUrl, cfg), { ...claudeSettings(cfg), statusLine: statusLineSetting() });
 	if (merged.error) return { path, changed: [], error: merged.error };
 	if (merged.changed.length) {
 		mkdirSync(dirname(path), { recursive: true });
@@ -328,6 +351,67 @@ export function writeClaudeSettings(cfg: RouterConfig, proxyUrl: string, path: s
 		}
 	}
 	return { path, changed: merged.changed };
+}
+
+// ----------------------------------------------------------------------------
+// Status line
+// ----------------------------------------------------------------------------
+
+/** The fields of Claude Code's statusline stdin JSON this renderer reads. */
+export type StatusLineInput = {
+	session_id?: string;
+	model?: { id?: string; display_name?: string };
+	context_window?: { used_percentage?: number | null; context_window_size?: number };
+};
+
+/** Session rows as `GET /jev-router/status` reports them. */
+export type StatusSessions = Record<string, { model: string; tier?: string; effort?: string; turns: number }>;
+
+/**
+ * One line for Claude Code's status bar: where this session's current turn
+ * went, how many subagents the proxy is routing under it, and context use.
+ * Pure — `sessions` is the daemon's map or undefined when it is not running.
+ */
+export function renderStatusLine(input: StatusLineInput, sessions: StatusSessions | undefined): string {
+	const parts: string[] = [];
+	if (sessions === undefined) {
+		parts.push("jev ▸ proxy not running");
+	} else {
+		const id = input.session_id ?? "";
+		const own = sessions[id];
+		if (!own) parts.push("jev ▸ waiting for first turn");
+		else {
+			const tier = own.tier ?? "pinned";
+			const effort = own.effort ? ` (${own.effort})` : "";
+			parts.push(`jev ▸ ${tier} → ${own.model}${effort}`);
+		}
+		const agents = Object.keys(sessions).filter((k) => k.startsWith(`${id}/`)).length;
+		if (agents) parts.push(`${agents} subagent${agents === 1 ? "" : "s"}`);
+	}
+	const pct = input.context_window?.used_percentage;
+	if (typeof pct === "number") parts.push(`ctx ${Math.round(pct)}%`);
+	return parts.join(" │ ");
+}
+
+/** Read Claude Code's statusline JSON from stdin, ask the daemon, print one line. Never throws, never slow. */
+export async function statusLineCommand(): Promise<void> {
+	let input: StatusLineInput = {};
+	try {
+		input = JSON.parse(await new Response(Bun.stdin.stream()).text()) as StatusLineInput;
+	} catch {
+		/* render with what we have */
+	}
+	let sessions: StatusSessions | undefined;
+	const entry = readPidFile();
+	if (entry) {
+		try {
+			const res = await fetch(`${entry.url}/jev-router/status`, { signal: AbortSignal.timeout(400) });
+			if (res.ok) sessions = ((await res.json()) as { sessions?: StatusSessions }).sessions ?? {};
+		} catch {
+			/* not running */
+		}
+	}
+	console.log(renderStatusLine(input, sessions));
 }
 
 /** Which `claude` to run: `CLAUDE_BIN`, else a real executable before a `.cmd` shim. */
@@ -345,7 +429,14 @@ export async function launchClaude(args: string[], opts: { cfg?: RouterConfig } 
 	const own = running.running ? undefined : createProxy({ cfg, port: cfg.claudeCode.port });
 	const url = running.running ? running.url : own!.url;
 	const env = { ...process.env, ...claudeEnv(url, cfg) };
-	const claudeArgs = args.some((a) => a === "--model" || a.startsWith("--model=")) ? args : ["--model", cfg.claudeCode.model, ...args];
+	// `--settings` carries the modelOverrides map for this session only, so a
+	// user's settings.json is untouched unless they run `env --write`. If they
+	// already passed --settings we leave theirs alone (they own the merge).
+	const { modelOverrides, model } = claudeSettings(cfg);
+	const withModel = args.some((a) => a === "--model" || a.startsWith("--model=")) ? args : ["--model", model, ...args];
+	const claudeArgs = withModel.some((a) => a === "--settings" || a.startsWith("--settings="))
+		? withModel
+		: ["--settings", JSON.stringify({ modelOverrides }), ...withModel];
 	const bin = resolveClaude();
 	if (!bin) {
 		console.error("jev-router: cannot find `claude` on PATH (set CLAUDE_BIN)");

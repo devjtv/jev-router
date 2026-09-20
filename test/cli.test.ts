@@ -11,8 +11,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../extensions/jev-router.ts";
-import { mergeClaudeSettings, readPidFile, serviceDefinition, writePidFile, BIN } from "../claude-code/proxy/daemon.ts";
-import { claudeEnv } from "../claude-code/proxy/server.ts";
+import { mergeClaudeSettings, readPidFile, renderStatusLine, serviceDefinition, statusLineSetting, writePidFile, BIN } from "../claude-code/proxy/daemon.ts";
+import { claudeEnv, claudeSettings } from "../claude-code/proxy/server.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "jev-router-cli-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -32,35 +32,77 @@ describe("pidfile", () => {
 
 describe("settings.json merge", () => {
 	const env = claudeEnv("http://127.0.0.1:1", DEFAULT_CONFIG);
+	const add = claudeSettings(DEFAULT_CONFIG);
 
-	test("adds env keys and a model to an empty file, preserving nothing it did not need to", () => {
-		const r = mergeClaudeSettings("", env, "jev-router");
+	test("adds env, modelOverrides and a model to an empty file", () => {
+		const r = mergeClaudeSettings("", env, add);
 		expect(r.error).toBeUndefined();
-		const parsed = JSON.parse(r.text) as { env: Record<string, string>; model: string };
+		const parsed = JSON.parse(r.text) as { env: Record<string, string>; model: string; modelOverrides: Record<string, string> };
 		expect(parsed.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:1");
-		expect(parsed.model).toBe("jev-router");
+		expect(parsed.env.ENABLE_TOOL_SEARCH).toBe("1");
+		expect(parsed.modelOverrides).toEqual({ "claude-opus-5": "jev-router" });
+		expect(parsed.model).toBe("claude-opus-5");
 		expect(r.changed).toContain("model");
+		expect(r.changed).toContain("modelOverrides.claude-opus-5");
 	});
 
-	test("keeps unrelated keys, other env vars, and a user-chosen model", () => {
-		const existing = JSON.stringify({ permissions: { allow: ["Bash"] }, env: { FOO: "bar", ANTHROPIC_BASE_URL: "old" }, model: "opus" });
-		const r = mergeClaudeSettings(existing, env, "jev-router");
-		const parsed = JSON.parse(r.text) as { permissions: unknown; env: Record<string, string>; model: string };
+	test("keeps unrelated keys, other env vars, other overrides, and a user-chosen model", () => {
+		const existing = JSON.stringify({
+			permissions: { allow: ["Bash"] },
+			env: { FOO: "bar", ANTHROPIC_BASE_URL: "old" },
+			modelOverrides: { "claude-sonnet-4-6": "my-sonnet" },
+			model: "opus",
+		});
+		const r = mergeClaudeSettings(existing, env, add);
+		const parsed = JSON.parse(r.text) as { permissions: unknown; env: Record<string, string>; model: string; modelOverrides: Record<string, string> };
 		expect(parsed.permissions).toEqual({ allow: ["Bash"] });
 		expect(parsed.env.FOO).toBe("bar");
 		expect(parsed.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:1");
+		expect(parsed.modelOverrides).toEqual({ "claude-sonnet-4-6": "my-sonnet", "claude-opus-5": "jev-router" });
 		expect(parsed.model).toBe("opus");
 		expect(r.changed).toContain("env.ANTHROPIC_BASE_URL");
 		expect(r.changed).not.toContain("model");
 	});
 
 	test("is a no-op when already up to date and refuses a broken file", () => {
-		const done = mergeClaudeSettings(JSON.stringify({ env, model: "jev-router" }), env, "jev-router");
+		const done = mergeClaudeSettings(JSON.stringify({ env, modelOverrides: add.modelOverrides, model: add.model }), env, add);
 		expect(done.changed).toEqual([]);
-		const broken = mergeClaudeSettings("{oops", env, "jev-router");
+		const broken = mergeClaudeSettings("{oops", env, add);
 		expect(broken.error).toContain("does not parse");
 		expect(broken.text).toBe("{oops");
-		expect(mergeClaudeSettings("[]", env, "jev-router").error).toContain("not an object");
+		expect(mergeClaudeSettings("[]", env, add).error).toContain("not an object");
+	});
+});
+
+describe("status line", () => {
+	const input = { session_id: "s1", model: { id: "claude-opus-5", display_name: "Opus 5" }, context_window: { used_percentage: 20.4 } };
+
+	test("shows this session's route, subagent count and context use", () => {
+		const sessions = {
+			s1: { model: "claude-haiku-4-5", tier: "fast", effort: "low", turns: 2 },
+			"s1/agent-a": { model: "claude-opus-5", tier: "deep", turns: 1 },
+			other: { model: "claude-opus-5", tier: "deep", turns: 1 },
+		};
+		expect(renderStatusLine(input, sessions)).toBe("jev ▸ fast → claude-haiku-4-5 (low) │ 1 subagent │ ctx 20%");
+	});
+
+	test("degrades: no turn yet, proxy down, pinned without a tier", () => {
+		expect(renderStatusLine(input, {})).toBe("jev ▸ waiting for first turn │ ctx 20%");
+		expect(renderStatusLine(input, undefined)).toBe("jev ▸ proxy not running │ ctx 20%");
+		expect(renderStatusLine({ session_id: "s1" }, { s1: { model: "claude-opus-5", turns: 0 } })).toBe("jev ▸ pinned → claude-opus-5");
+		expect(renderStatusLine({}, undefined)).toBe("jev ▸ proxy not running");
+	});
+
+	test("statusLine setting points at the CLI and is added only when absent", () => {
+		const sl = statusLineSetting("C:\\tools\\bun.exe", "C:\\me\\jev router\\bin\\jev-router.ts");
+		expect(sl.command).toBe('C:/tools/bun.exe "C:/me/jev router/bin/jev-router.ts" statusline');
+		const env = claudeEnv("http://127.0.0.1:1", DEFAULT_CONFIG);
+		const add = { ...claudeSettings(DEFAULT_CONFIG), statusLine: sl };
+		expect(JSON.parse(mergeClaudeSettings("", env, add).text).statusLine).toEqual(sl);
+		const mine = { type: "command", command: "my-statusline" };
+		const kept = mergeClaudeSettings(JSON.stringify({ statusLine: mine }), env, add);
+		expect(JSON.parse(kept.text).statusLine).toEqual(mine);
+		expect(kept.changed).not.toContain("statusLine");
 	});
 });
 
@@ -140,8 +182,9 @@ describe("daemon lifecycle through the CLI", () => {
 		const out = await new Response(p.stdout).text();
 		expect(await p.exited).toBe(0);
 		expect(out).toContain("wrote");
-		const settings = JSON.parse(readFileSync(join(claudeDir, "settings.json"), "utf8")) as { env: Record<string, string>; model: string };
-		expect(settings.env.ANTHROPIC_CUSTOM_MODEL_OPTION).toBe("jev-router");
-		expect(settings.model).toBe("jev-router");
+		const settings = JSON.parse(readFileSync(join(claudeDir, "settings.json"), "utf8")) as { env: Record<string, string>; model: string; modelOverrides: Record<string, string> };
+		expect(settings.env.ANTHROPIC_BASE_URL).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+		expect(settings.modelOverrides["claude-opus-5"]).toBe("jev-router");
+		expect(settings.model).toBe("claude-opus-5");
 	});
 });

@@ -278,15 +278,22 @@ ok multi-file   jev=deep      deep → @task (high)        266ms
 `claude-code/` routes Claude Code too, but not from a hook — a Claude Code hook
 cannot switch the model (`PreModelSwitch` can only `allow`/`ask`/`deny` a switch
 someone else requested). What Claude Code *does* give you is a gateway: it sends
-every request to `ANTHROPIC_BASE_URL`, passes any model name through unchecked,
-and `ANTHROPIC_CUSTOM_MODEL_OPTION` puts that name in the `/model` picker. So
-`claude-code/proxy` **is a model called `jev-router`**. Select it and every user
-turn is gated by Jev and forwarded to the real model for its tier:
+every request to `ANTHROPIC_BASE_URL` and passes the model name through. So
+`claude-code/proxy` **is a model called `jev-router`**, and a `modelOverrides`
+entry (`{"claude-opus-5": "jev-router"}`) tells Claude Code to *behave as* Opus —
+window, tool search, picker label — while putting `jev-router` on the wire. Every
+user turn is then gated by Jev and forwarded to the real model for its tier:
 
 ```
-claude ──▶ 127.0.0.1:47131 (model: jev-router) ──▶ jev: which tier? ──▶ rewrite model + effort ──▶ api.anthropic.com
-                                                    ~0.3s, once per user turn
+claude (thinks: Opus 5) ──▶ 127.0.0.1:47131 (wire: jev-router) ──▶ jev: which tier? ──▶ rewrite model + effort ──▶ api.anthropic.com
+                                                                      ~0.3s, once per user turn
 ```
+
+**See where a turn went** from inside Claude Code: `jev-router env --write`
+installs a `statusLine` (only if you have none) that renders
+`jev ▸ fast → claude-haiku-4-5 (low) │ 1 subagent │ ctx 20%` and updates as the
+session goes; `jev-router logs -f` follows the full JSONL; `jev-router status`
+lists every live session's pin.
 
 ### CLI and background service
 
@@ -295,8 +302,8 @@ bun add -g github:devjtv/jev-router      # or, in a clone: bun link  → `jev-ro
 
 jev-router start                          # background proxy; pidfile in ~/.omp/agent, log in ~/.omp/agent/jev-router-proxy.log
 jev-router status                         # pid, url, tier → model map, live sessions
-jev-router env --write                    # merge the env block into ~/.claude/settings.json (backs up first)
-claude                                    # …then plain claude starts on the jev-router model
+jev-router env --write                    # merge env + modelOverrides + statusLine into ~/.claude/settings.json (backs up first)
+claude                                    # …then plain claude runs on the gateway model, showing as "Opus 5"
 
 jev-router service install                # start at login: systemd --user / launchd / Windows Task Scheduler
 jev-router service show                   # print the unit/plist/task it would write
@@ -330,9 +337,13 @@ Being at the request layer gives the proxy control the OMP extension does not ha
 - **Nothing else is touched.** Requests for any other model name — Claude Code's
   background Haiku traffic, a subagent with its own `model:` — pass through byte-for-byte.
 - **Field compatibility is learned.** If a routed model rejects
-  `output_config.effort`, adaptive `thinking`, or a `clear_thinking` context edit
-  with a 400, the proxy strips that field, retries once, and pre-strips it for
-  that model from then on. Verified live: Haiku 4.5 rejects the first two.
+  `output_config.effort`, adaptive `thinking`, a `clear_thinking` context edit,
+  or the `context-1m` beta with a 400, the proxy strips that field (or header),
+  retries once, and pre-strips it for that model from then on. Verified live:
+  Haiku 4.5 rejects the first two; a 200k plan rejects the last.
+- **Context size is protected twice.** Above `maxRouteTokens` (150k) a turn is
+  not routed at all — a 300k context cannot go to a 200k model. And a session's
+  *first* turn is never cache-guarded: there is no cache to protect yet.
 
 Configuration lives under `claudeCode` in the same `jev-router.json`:
 
@@ -346,7 +357,9 @@ Configuration lives under `claudeCode` in the same `jev-router.json`:
   "effort": true,                        // apply the candidate's effort as output_config.effort
   "stripThinkingOnSwitch": true,         // drop prior thinking blocks when the model changes between turns
   "subagents": "route",                  // "route" | "inherit" | "fallback"
-  "backgroundMaxTokens": 1024            // requests at or below this max_tokens are housekeeping
+  "backgroundMaxTokens": 1024,           // requests at or below this max_tokens are housekeeping
+  "behavesAs": "claude-opus-5",          // the real id Claude Code is told it runs; "claude-opus-5[1m]" if your plan has 1M
+  "maxRouteTokens": 150000               // estimated prompt tokens above which a turn goes to fallbackModel unrouted
 }
 ```
 
@@ -358,9 +371,8 @@ OMP reads the proxy's lines too (`"host":"claude-code"`).
 The `PreModelSwitch` hook plugin is still there for the case it fits — a manual
 `/model` switch on a warm cache — and reports what the switch re-sends. See
 [claude-code/README.md](./claude-code/README.md) for both, including the live
-run and its rough edges (Claude Code warns once that `jev-router` is not in
-its model catalog and assumes a 200k window; `/cost` bills the alias at an
-unknown rate).
+runs. Known rough edge: `/cost` bills the alias at Opus rates whatever tier
+actually ran; use `jev-router logs` or `/jev-router stats` in OMP for spend.
 
 ## Honest caveats
 

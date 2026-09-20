@@ -46,6 +46,7 @@ import {
 	modelFamily,
 	promptText,
 	sessionKey,
+	stripBetas,
 	tierModel,
 	turnFingerprint,
 	usageFromSse,
@@ -179,7 +180,10 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 		const current = prev?.model ?? cc.fallbackModel;
 		const prompt = promptText(body);
 		const images = hasImages(body);
-		const tokens = prev?.contextTokens ?? estimateTokens(body);
+		// The guard protects a *warm* cache. On a session's first turn there is
+		// none, so the size of the prompt is irrelevant to the switch decision;
+		// later turns use the upstream's real usage figure.
+		const tokens = prev ? prev.contextTokens : undefined;
 
 		let model = current;
 		let effort = prev?.effort;
@@ -208,6 +212,12 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 			reason = `images: ${model}`;
 		} else if (!prompt) {
 			reason = "empty prompt";
+		} else if ((tokens ?? estimateTokens(body)) > cc.maxRouteTokens) {
+			// Too big for a smaller model's window: only the fallback is safe.
+			model = cc.fallbackModel;
+			effort = undefined;
+			tier = undefined;
+			reason = `${(tokens ?? estimateTokens(body)).toLocaleString()} tokens exceeds maxRouteTokens — ${model}`;
 		} else {
 			decision = await gate(prompt);
 			const route = planRoute(decision, cfg, rng);
@@ -281,11 +291,14 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 
 	/** Forward a rewritten Messages request, stripping fields the model rejects and retrying once per field. */
 	async function forwardMessages(req: Request, url: URL, body: MessagesBody, target: Target, state: SessionState | undefined): Promise<Response> {
-		const headers = forwardHeaders(req.headers);
-		const MAX_RETRIES = 3; // one per CompatField
+		const MAX_RETRIES = 4; // one per CompatField
 		for (let attempt = 0; ; attempt++) {
 			const known = quirks.get(target.model);
-			const shaped = applyTarget(body, { ...target, drop: [...(target.drop ?? []), ...(known ?? [])] });
+			const drop = [...(target.drop ?? []), ...(known ?? [])];
+			const shaped = applyTarget(body, { ...target, drop });
+			const headers = forwardHeaders(req.headers);
+			const betas = stripBetas(headers.get("anthropic-beta"), drop);
+			if (betas !== undefined) headers.set("anthropic-beta", betas);
 			const res = await fetchImpl(`${upstream}${url.pathname}${url.search}`, { method: "POST", headers, body: JSON.stringify(shaped) });
 			if (res.status === 400 && attempt < MAX_RETRIES) {
 				const text = await res.clone().text();
@@ -418,6 +431,8 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 				lastBlocks: Array.isArray(last?.content) ? last.content.map((b: { type?: unknown }) => b?.type) : typeof last?.content,
 				tools: Array.isArray(body.tools) ? body.tools.length : 0,
 				maxTokens: body.max_tokens,
+				deferred: Array.isArray(body.tools) ? body.tools.filter((t) => (t as { defer_loading?: unknown }).defer_loading === true).length : 0,
+				betas: req.headers.get("anthropic-beta") ?? undefined,
 			});
 		}
 		let state = sessions.get(key);
@@ -429,6 +444,7 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 				headers: forwardHeaders(req.headers),
 				body: JSON.stringify({ ...body, model }),
 			});
+			if (debug) log({ event: "count_tokens", host: "claude-code", model, status: res.status, body: res.ok ? undefined : (await res.clone().text()).slice(0, 300) });
 			return new Response(res.body, { status: res.status, headers: responseHeaders(res.headers) });
 		}
 
@@ -504,17 +520,25 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 	};
 }
 
-/** Environment Claude Code needs to treat the proxy as a model and start on it. */
-export function claudeEnv(proxyUrl: string, cfg: RouterConfig): Record<string, string> {
+/**
+ * What Claude Code needs to run on the gateway model. Two halves:
+ *
+ * - env: `ANTHROPIC_BASE_URL` points at the proxy. `ENABLE_TOOL_SEARCH` keeps
+ *   MCP tool deferral on behind a gateway, where Claude Code otherwise inlines
+ *   every tool schema (measured: 134k vs 53k tokens of baseline prompt).
+ * - settings: `modelOverrides` maps the real id in `behavesAs` to the wire
+ *   name. Claude Code then takes window, capabilities and picker label from
+ *   the real model and sends `jev-router` on the wire — the documented way to
+ *   give a gateway alias a model's capabilities. `_SUPPORTED_CAPABILITIES`
+ *   env vars have no effect behind `ANTHROPIC_BASE_URL`.
+ *
+ * The model to select is therefore `behavesAs`, not `model`.
+ */
+export function claudeEnv(proxyUrl: string, _cfg: RouterConfig): Record<string, string> {
+	return { ANTHROPIC_BASE_URL: proxyUrl, ENABLE_TOOL_SEARCH: "1" };
+}
+
+export function claudeSettings(cfg: RouterConfig): { modelOverrides: Record<string, string>; model: string } {
 	const cc = cfg.claudeCode;
-	const tiers = Object.keys(cfg.tiers)
-		.map((t) => `${t}=${tierModel(t, cfg)}`)
-		.join(", ");
-	return {
-		ANTHROPIC_BASE_URL: proxyUrl,
-		ANTHROPIC_CUSTOM_MODEL_OPTION: cc.model,
-		ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: "jev-router",
-		ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION: `Routes each turn with Jev: ${tiers}`,
-		ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking",
-	};
+	return { modelOverrides: { [cc.behavesAs]: cc.model }, model: cc.behavesAs };
 }

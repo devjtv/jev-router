@@ -19,9 +19,10 @@ import {
 	tierModel,
 	turnFingerprint,
 	usageFromSse,
+	stripBetas,
 	usageTokens,
 } from "../claude-code/proxy/routing.ts";
-import { claudeEnv, createProxy } from "../claude-code/proxy/server.ts";
+import { claudeEnv, claudeSettings, createProxy } from "../claude-code/proxy/server.ts";
 
 // ----------------------------------------------------------------------------
 // Fixtures
@@ -46,7 +47,7 @@ const body = (messages: unknown[], over: Record<string, unknown> = {}) => ({
 });
 
 const cfg: RouterConfig = mergeConfig(
-	{ log: false, notify: false, pick: "first", minConfidence: 0, cacheGuardTokens: 60_000 },
+	{ log: false, notify: false, pick: "first", minConfidence: 0, cacheGuardTokens: 60_000, claudeCode: { maxRouteTokens: 1_000_000 } },
 	DEFAULT_CONFIG,
 );
 
@@ -198,11 +199,21 @@ describe("claudeCode config", () => {
 		expect(merged.claudeCode.models).not.toBe(DEFAULT_CONFIG.claudeCode.models);
 	});
 
-	test("claudeEnv names the proxy as a custom model option", () => {
+	test("claudeEnv points at the proxy and keeps tool search; claudeSettings maps behavesAs → wire name", () => {
 		const env = claudeEnv("http://127.0.0.1:1", cfg);
-		expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:1");
-		expect(env.ANTHROPIC_CUSTOM_MODEL_OPTION).toBe("jev-router");
-		expect(env.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION).toContain("fast=claude-haiku-4-5");
+		expect(env).toEqual({ ANTHROPIC_BASE_URL: "http://127.0.0.1:1", ENABLE_TOOL_SEARCH: "1" });
+		expect(claudeSettings(cfg)).toEqual({ modelOverrides: { "claude-opus-5": "jev-router" }, model: "claude-opus-5" });
+		const oneM = mergeConfig({ claudeCode: { behavesAs: "claude-opus-5[1m]" } }, cfg);
+		expect(claudeSettings(oneM).modelOverrides).toEqual({ "claude-opus-5[1m]": "jev-router" });
+	});
+
+	test("stripBetas removes only the 1M beta, only when asked", () => {
+		const header = "claude-code-20250219,context-1m-2025-08-07,effort-2025-11-24";
+		expect(stripBetas(header, ["context_1m"])).toBe("claude-code-20250219,effort-2025-11-24");
+		expect(stripBetas(header, ["effort"])).toBeUndefined();
+		expect(stripBetas("effort-2025-11-24", ["context_1m"])).toBeUndefined();
+		expect(stripBetas(null, ["context_1m"])).toBeUndefined();
+		expect(compatProblem(400, "The long context beta is not yet available for this subscription.")).toBe("context_1m");
 	});
 });
 
@@ -212,7 +223,7 @@ describe("claudeCode config", () => {
 
 type Seen = { path: string; headers: Record<string, string>; body: Record<string, unknown> };
 const seen: Seen[] = [];
-let upstreamMode: "json" | "sse" | "reject-effort-once" | "reject-thinking" | "overloaded" = "json";
+let upstreamMode: "json" | "sse" | "reject-effort-once" | "reject-thinking" | "reject-1m" | "overloaded" = "json";
 let rejected = 0;
 
 const upstream = Bun.serve({
@@ -232,6 +243,9 @@ const upstream = Bun.serve({
 		}
 		if (upstreamMode === "reject-thinking" && parsed.thinking) {
 			return Response.json({ type: "error", error: { type: "invalid_request_error", message: "thinking: adaptive is not supported on this model" } }, { status: 400 });
+		}
+		if (upstreamMode === "reject-1m" && /context-1m/.test(headers["anthropic-beta"] ?? "")) {
+			return Response.json({ type: "error", error: { type: "invalid_request_error", message: "The long context beta is not yet available for this subscription." } }, { status: 400 });
 		}
 		if (upstreamMode === "overloaded") {
 			return Response.json({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }, { status: 529, headers: { "retry-after": "3", "x-should-retry": "true" } });
@@ -416,6 +430,40 @@ describe("gateway model", () => {
 		expect(route?.guarded).toBe(true);
 		expect(route?.reason).toContain("tokens in context");
 		expect(route?.contextTokens).toBe(150_005);
+	});
+
+	test("the first turn of a session is never cache-guarded: there is no cache yet", async () => {
+		const proxy = makeProxy();
+		proxies.push(proxy);
+		decisions.tiny = "fast";
+		// A ~200KB request: the old estimate-based guard would have pinned opus.
+		await post(proxy.url, body([user("tiny")], { system: "x".repeat(400_000) }));
+		expect(seen[0]!.body.model).toBe("claude-haiku-4-5");
+		const route = logs.filter((l) => l.event === "route").at(-1);
+		expect(route?.guarded).toBe(false);
+	});
+
+	test("a prompt above maxRouteTokens goes to the fallback model without a gate call", async () => {
+		const proxy = makeProxy({}, { maxRouteTokens: 10_000 });
+		proxies.push(proxy);
+		decisions.huge = "fast";
+		await post(proxy.url, body([user("huge")], { system: "x".repeat(100_000) }));
+		expect(gateCalls).toBe(0);
+		expect(seen[0]!.body.model).toBe(cfg.claudeCode.fallbackModel);
+		expect(logs.filter((l) => l.event === "route").at(-1)?.reason).toContain("maxRouteTokens");
+	});
+
+	test("a model that refuses the 1M beta gets the header stripped and retried", async () => {
+		const proxy = makeProxy();
+		proxies.push(proxy);
+		upstreamMode = "reject-1m";
+		decisions.a = "fast";
+		const res = await post(proxy.url, body([user("a")]), { "anthropic-beta": "oauth-2025-04-20,context-1m-2025-08-07,effort-2025-11-24" });
+		expect(res.status).toBe(200);
+		expect(seen).toHaveLength(2);
+		expect(seen[0]!.headers["anthropic-beta"]).toContain("context-1m");
+		expect(seen[1]!.headers["anthropic-beta"]).toBe("oauth-2025-04-20,effort-2025-11-24");
+		expect(logs.some((l) => l.event === "compat" && l.dropped === "context_1m")).toBe(true);
 	});
 
 	test("a model that rejects effort gets it stripped and retried, once, then pre-stripped", async () => {

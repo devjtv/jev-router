@@ -112,6 +112,18 @@ export type ClaudeCodeConfig = {
 	 * tier's model without a gate call and never touch the session's pin.
 	 */
 	backgroundMaxTokens: number;
+	/**
+	 * The real model id Claude Code is told it is running, via
+	 * `modelOverrides: { [behavesAs]: model }`. Claude Code takes its context
+	 * window, tool-search and capability decisions from this id and puts
+	 * `model` on the wire. Append `[1m]` for the 1M window when your plan has it.
+	 */
+	behavesAs: string;
+	/**
+	 * Estimated prompt tokens above which a turn is not routed and goes to
+	 * `fallbackModel`: a 300k-token context cannot be sent to a 200k model.
+	 */
+	maxRouteTokens: number;
 };
 
 export type RouterConfig = {
@@ -232,6 +244,8 @@ export const DEFAULT_CONFIG: RouterConfig = {
 		stripThinkingOnSwitch: true,
 		subagents: "route",
 		backgroundMaxTokens: 1_024,
+		behavesAs: "claude-opus-5",
+		maxRouteTokens: 150_000,
 	},
 };
 
@@ -374,6 +388,8 @@ export function mergeConfig(file: unknown, base: RouterConfig = DEFAULT_CONFIG):
 		if (cc.subagents === "route" || cc.subagents === "inherit" || cc.subagents === "fallback") c.subagents = cc.subagents;
 		if (typeof cc.backgroundMaxTokens === "number" && Number.isFinite(cc.backgroundMaxTokens) && cc.backgroundMaxTokens >= 0)
 			c.backgroundMaxTokens = cc.backgroundMaxTokens;
+		if (typeof cc.behavesAs === "string" && cc.behavesAs.trim()) c.behavesAs = cc.behavesAs.trim();
+		if (typeof cc.maxRouteTokens === "number" && Number.isFinite(cc.maxRouteTokens) && cc.maxRouteTokens > 0) c.maxRouteTokens = cc.maxRouteTokens;
 		const models = asObject(cc.models);
 		if (models) {
 			for (const [tier, id] of Object.entries(models)) {

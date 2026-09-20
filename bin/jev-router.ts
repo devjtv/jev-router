@@ -31,9 +31,11 @@ import {
 	tailLog,
 	uninstallService,
 	writeClaudeSettings,
+	statusLineCommand,
+	statusLineSetting,
 	type Status,
 } from "../claude-code/proxy/daemon.ts";
-import { claudeEnv } from "../claude-code/proxy/server.ts";
+import { claudeEnv, claudeSettings } from "../claude-code/proxy/server.ts";
 import { tierModel } from "../claude-code/proxy/routing.ts";
 
 const [cmd = "help", ...rest] = process.argv.slice(2);
@@ -129,9 +131,13 @@ switch (cmd) {
 			console.log(r.changed.length ? `wrote ${r.path}: ${r.changed.join(", ")}` : `${r.path} already up to date`);
 			if (!s.running) console.log(`proxy is not running; \`jev-router start\` (or \`service install\`) before using claude`);
 		} else {
-			console.log(JSON.stringify({ env, model: cfg.claudeCode.model }, null, 2));
-			console.log(`# jev-router env --write  merges this into ${claudeSettingsPath()}`);
+			console.log(JSON.stringify({ env, ...claudeSettings(cfg), statusLine: statusLineSetting() }, null, 2));
+			console.log(`# jev-router env --write  merges this into ${claudeSettingsPath()} (statusLine only if you have none)`);
 		}
+		break;
+	}
+	case "statusline": {
+		await statusLineCommand();
 		break;
 	}
 	case "logs": {
@@ -173,6 +179,7 @@ switch (cmd) {
 				"  claude [args…]              run Claude Code on the gateway model",
 				"  env [--write]               env block for Claude Code; --write merges into settings.json",
 				"  logs [-n N] [-f]            routing log",
+				"  statusline                  Claude Code statusLine command: shows this session's route",
 				"  route <text>                dry-run the gate",
 				"",
 				"config: ~/.omp/agent/jev-router.json  (JEV_ROUTER_CONFIG)",

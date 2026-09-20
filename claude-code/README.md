@@ -14,9 +14,17 @@ Two pieces, sharing `~/.omp/agent/jev-router.json` with the OMP extension:
   SDK host or Remote Control", not from a plugin.
 - **A gateway can.** Claude Code sends every request to `ANTHROPIC_BASE_URL`;
   behind a gateway "your provider or gateway defines the model names, so Claude
-  Code passes any string through without checking it"; and
-  `ANTHROPIC_CUSTOM_MODEL_OPTION` adds that string to the `/model` picker with a
-  `_NAME`, `_DESCRIPTION` and `_SUPPORTED_CAPABILITIES`.
+  Code passes any string through without checking it".
+- **`modelOverrides` gives the alias a real model's identity.** "To give a
+  gateway alias the capabilities of the model behind it, map that model's
+  Anthropic ID to your alias with a `modelOverrides` entry." So the settings
+  carry `{"modelOverrides": {"claude-opus-5": "jev-router"}}` and you select
+  `claude-opus-5`: Claude Code uses Opus's window, tool search and picker label,
+  and sends `jev-router` on the wire. (`ANTHROPIC_CUSTOM_MODEL_OPTION` also
+  works but "`_SUPPORTED_CAPABILITIES` … have no effect behind an
+  `ANTHROPIC_BASE_URL` gateway", and the alias is then an unknown model — see
+  the 134k-token finding below.)
+- **`ENABLE_TOOL_SEARCH=1`** keeps MCP tool deferral on behind the gateway.
 - **Your login survives.** "Setting only `ANTHROPIC_BASE_URL`, without a gateway
   credential, doesn't replace the subscription" — the proxy forwards
   `Authorization` and `anthropic-beta` verbatim, which the OAuth path requires.
@@ -54,9 +62,29 @@ exits silently).
 - `service install` writes a systemd user unit, a launchd agent, or a
   Task Scheduler logon task that runs `jev-router start`; `service show`
   prints it first. On Windows the task's console flashes once at logon.
-- `env --write` merges only the five `env` keys it owns into `settings.json`
-  (`CLAUDE_CONFIG_DIR` respected), sets `model` only when absent, writes a
-  `.bak`, and refuses a file that does not parse.
+- `env --write` merges only what it owns into `settings.json` (`CLAUDE_CONFIG_DIR`
+  respected): `env.ANTHROPIC_BASE_URL`, `env.ENABLE_TOOL_SEARCH`,
+  `modelOverrides.<behavesAs>`; sets `model` and `statusLine` only when absent;
+  writes a `.bak`; refuses a file that does not parse. `jev-router claude`
+  passes the same `modelOverrides` via `--settings` for one session instead.
+
+### Seeing where a turn went
+
+`jev-router statusline` is a Claude Code `statusLine` command: it reads the
+session id Claude Code hands every status refresh, asks the daemon, and prints
+
+```
+jev ▸ fast → claude-haiku-4-5 (low) │ 1 subagent │ ctx 20%
+jev ▸ waiting for first turn │ ctx 5%
+jev ▸ proxy not running
+```
+
+`env --write` installs it if you have no `statusLine`; otherwise add
+`jev-router statusline` to your own script's output. The session id in the
+statusline payload is the same value as the `x-claude-code-session-id` header
+the proxy keys on (checked live), so a subagent count and the pinned tier are
+exact, not inferred. `jev-router logs -f` and `jev-router status` show the same
+from the terminal.
 
 Or let your agent do it — paste into Claude Code (or any agent with a shell):
 
@@ -116,12 +144,21 @@ route       deep → claude-opus-5       conf=0.46  248ms  "Read package.json �
 continuation ×7  claude-opus-5 (pinned)          count_tokens → claude-opus-5
 ```
 
-Both prompts answered correctly. Rough edges seen: Claude Code prints once
-that `"jev-router" isn't described by this version's model catalog` and assumes
-a 200k window (set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` if your tiers' models allow
-more); `/cost` and the `-p` JSON `modelUsage` bill the alias at an unknown rate,
-so use `/jev-router stats` in OMP or the log for spend; the `_NAME`/`_DESCRIPTION`
-picker labels take effect only behind a gateway, which this is.
+Both prompts answered correctly.
+
+**Second live pass — the 190k-tokens-at-start bug.** With the alias installed
+as an unknown model, an interactive session showed 134k tokens of baseline
+prompt where a direct Opus session showed 53k. Cause: behind the gateway Claude
+Code inlined every MCP tool schema (151 tools, 0 deferred, no tool-search beta)
+and assumed a 200k window. Fix, measured in the same setup: `modelOverrides`
+(so the session *is* Opus to Claude Code) + `ENABLE_TOOL_SEARCH=1` → 22 tools,
+4 deferred, **39.8k tokens (20%)**, no catalog warning. Two more things fell out
+of that pass and are now handled: a 200k plan rejects the `context-1m` beta
+when a turn is routed to Haiku (the proxy strips the header and retries), and
+the cache guard used to fire on a session's first turn from a size estimate
+alone, pinning Opus — there is no cache to protect on a first turn, so it no
+longer does. Remaining rough edge: `/cost` bills the alias at Opus rates
+regardless of the tier that ran; use `jev-router logs` or `/jev-router stats`.
 
 ### Config
 

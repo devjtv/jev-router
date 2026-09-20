@@ -170,8 +170,23 @@ export function modelFamily(id: string): string {
 	return m ? m[1]!.toLowerCase() : id;
 }
 
-/** Request fields a routed model may reject; each is stripped and the request retried. */
-export type CompatField = "effort" | "thinking" | "context_management";
+/**
+ * Request features a routed model may reject; each is stripped and the request
+ * retried. Body fields: `effort`, `thinking`, `context_management`. Header
+ * only: `context_1m` (the `context-1m-*` beta a 200k model or plan refuses).
+ */
+export type CompatField = "effort" | "thinking" | "context_management" | "context_1m";
+
+/** `anthropic-beta` with the values a dropped field implies removed; undefined when nothing changes. */
+export function stripBetas(header: string | null, drop: readonly CompatField[]): string | undefined {
+	if (!header || !drop.includes("context_1m")) return undefined;
+	const kept = header
+		.split(",")
+		.map((b) => b.trim())
+		.filter((b) => b && !/^context-1m-/.test(b));
+	const next = kept.join(",");
+	return next === header ? undefined : next;
+}
 
 export type Target = { model: string; effort?: string; stripThinking?: boolean; drop?: readonly CompatField[] };
 
@@ -222,6 +237,7 @@ export function applyTarget(body: MessagesBody, target: Target): MessagesBody {
  */
 export function compatProblem(status: number, errorBody: string): CompatField | undefined {
 	if (status !== 400) return undefined;
+	if (/long context beta|context-1m|1m context/i.test(errorBody)) return "context_1m";
 	if (/context_management|clear_thinking|clear_tool_uses/i.test(errorBody)) return "context_management";
 	if (/output_config|effort/i.test(errorBody)) return "effort";
 	if (/thinking/i.test(errorBody)) return "thinking";

@@ -12,7 +12,7 @@
 
 import { loadConfig } from "../extensions/jev-router.ts";
 import { launchClaude, status, tailLog } from "./proxy/daemon.ts";
-import { claudeEnv } from "./proxy/server.ts";
+import { claudeEnv, claudeSettings } from "./proxy/server.ts";
 
 const args = process.argv.slice(2);
 
@@ -20,7 +20,7 @@ if (args.includes("--env")) {
 	const cfg = loadConfig();
 	const s = await status();
 	const url = s.running ? s.url : `http://127.0.0.1:${cfg.claudeCode.port}`;
-	console.log(JSON.stringify({ env: claudeEnv(url, cfg), model: cfg.claudeCode.model }, null, 2));
+	console.log(JSON.stringify({ env: claudeEnv(url, cfg), ...claudeSettings(cfg) }, null, 2));
 	process.exit(0);
 }
 if (args.includes("--tail")) {
