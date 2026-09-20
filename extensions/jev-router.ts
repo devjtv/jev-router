@@ -531,6 +531,26 @@ export function truncatePrompt(text: string, max: number): string {
 }
 
 /**
+ * Facts about a repository, as one line for the gate's state: path, branch, and
+ * which files are already modified. This is the signal for blast radius — "add
+ * an endpoint" in a clean repo is smaller than the same words in a repo with
+ * forty files in flight.
+ *
+ * `porcelain` is `git status --porcelain=v1 -b` output; the function is pure so
+ * both hosts can share it and it can be tested without a repo.
+ */
+export function repoFacts(cwd: string, porcelain: string | undefined, maxFiles = 8): string {
+	if (!porcelain) return cwd;
+	const lines = porcelain.split("\n").filter(Boolean);
+	if (!lines.length) return cwd;
+	const branch = (lines[0] ?? "").replace(/^##\s*/, "").split("...")[0]?.trim();
+	const files = lines.slice(1).map((l) => l.slice(3).trim()).filter(Boolean);
+	const shown = files.slice(0, maxFiles).join(", ");
+	const more = files.length > maxFiles ? ` (+${files.length - maxFiles} more)` : "";
+	return `${cwd} · branch ${branch || "?"} · ${files.length} changed file(s)${files.length ? `: ${shown}${more}` : ""}`;
+}
+
+/**
  * True when a message is only a continuation of the previous one — "go", "yes,
  * do it", "ok, go ahead". A two-word turn is not a two-word job: the gate is
  * told what it continues, and this is what marks it as a continuation.
@@ -571,16 +591,23 @@ export function pickCandidate(
 }
 
 export type Decision =
-	| {
-			kind: "tier";
-			tier: string;
-			why?: string;
-			confidence?: number;
-			/** Gate's probability per tier option, when it reports one. */
-			probabilities?: Record<string, number>;
-			latencyMs: number;
-			source: string;
-	  }
+		| {
+				kind: "tier";
+				tier: string;
+				why?: string;
+				confidence?: number;
+				/** Gate's probability per tier option, when it reports one. */
+				probabilities?: Record<string, number>;
+				/**
+				 * What the gate says it would need to tier this confidently:
+				 * `"prior_turn"`, `"repo"`, `"none"`. The router supplies it when it
+				 * has it — and records it when it does not, so the turn's cost is
+				 * explainable rather than mysterious.
+				 */
+				needsContext?: string;
+				latencyMs: number;
+				source: string;
+		  }
 	| {
 			kind: "action";
 			action: string;
@@ -1127,7 +1154,20 @@ export async function askTiers(
 	request: string,
 	repoSummary: string,
 	cfg: RouterConfig,
-	opts: { creds?: JevCreds; timeoutMs: number; fetchImpl?: typeof fetch; signal?: AbortSignal; priorContext?: string },
+	opts: {
+		creds?: JevCreds;
+		timeoutMs: number;
+		fetchImpl?: typeof fetch;
+		signal?: AbortSignal;
+		priorContext?: string;
+		/**
+		 * Repository facts, offered but not sent on the first call: the gate asks
+		 * for them (`context_request: "repo"`) only when they would change the
+		 * tier, and then one more call supplies them. Sending them always would
+		 * cost tokens on every turn and nudge a dirty tree toward escalation.
+		 */
+		repoContext?: string;
+	},
 ): Promise<Decision> {
 	const creds = opts.creds ?? resolveCreds(process.env, cfg.gate);
 	if (!creds) throw new Error("no Jev credential (set OPENROUTER_API_KEY or run jev-gate key set)");
@@ -1154,9 +1194,33 @@ export async function askTiers(
 				contract: "an interface or data shape is unstated",
 			},
 		},
+		context_request: {
+			type: "choice",
+			instructions:
+				"What extra context, if it exists, would most change the tier? Name it even when you are reasonably sure — the router will fetch it when it can and re-ask.",
+			criteria: {
+				none: "`request` and what is already supplied are enough to tier this confidently",
+				prior_turn: "the turn before this one (what it asked for, what was said back) would settle the size of the work",
+				repo: "the repository's state (branch, which files are already modified, how large the area is) would settle the blast radius",
+			},
+		},
 	};
 	const prior = opts.priorContext?.trim();
-	const { answers, latencyMs } = await callDecisions(creds, { request, repo_summary: repoSummary, ...(prior ? { prior_context: prior } : {}) }, questions, opts);
+	const build = (p: string | undefined, repo: string) => ({ request, repo_summary: repo, ...(p ? { prior_context: p } : {}) });
+	const first = await callDecisions(creds, build(prior, repoSummary), questions, opts);
+	const wanted = first.answers.context_request?.choice;
+	let answers = first.answers;
+	let latencyMs = first.latencyMs;
+	// Jev names the context that would settle the tier. When it is context the
+	// caller offered but withheld, one more call supplies it — never a loop, and
+	// never a second call without Jev having asked.
+	let supplied: string | undefined;
+	if (wanted === "repo" && opts.repoContext && opts.repoContext !== repoSummary) {
+		const second = await callDecisions(creds, build(prior, opts.repoContext), questions, opts);
+		answers = second.answers;
+		latencyMs += second.latencyMs;
+		supplied = "repo";
+	}
 	const tier = answers.tier?.choice ?? "";
 	if (!tier || !cfg.tiers[tier]) {
 		return {
@@ -1168,12 +1232,16 @@ export async function askTiers(
 		};
 	}
 	const missing = answers.missing_decision?.choice;
+	const why = [missing && missing !== "none" ? `unstated ${missing}` : undefined, supplied ? `re-asked with ${supplied} facts` : undefined]
+		.filter(Boolean)
+		.join(" · ");
 	return {
 		kind: "tier",
 		tier,
-		why: missing && missing !== "none" ? `unstated ${missing}` : undefined,
+		why: why || undefined,
 		confidence: answers.tier?.confidence,
 		probabilities: answers.tier?.probabilities,
+		needsContext: answers.context_request?.choice,
 		latencyMs,
 		source: "tiers",
 	};
@@ -1410,11 +1478,7 @@ export default function jevRouterExtension(pi: ExtensionAPI): void {
 		let text = base;
 		try {
 			const res = await pi.exec("git", ["status", "--porcelain=v1", "-b"], { cwd: base });
-			if (res.code === 0) {
-				const lines = res.stdout.split("\n").filter(Boolean);
-				const branch = (lines[0] ?? "").replace(/^##\s*/, "").split("...")[0];
-				text = `${base} · git branch ${branch || "?"} · ${Math.max(0, lines.length - 1)} changed file(s)`;
-			}
+			if (res.code === 0) text = repoFacts(base, res.stdout);
 		} catch {
 			/* not a repo, or git absent: the path alone is still useful */
 		}
@@ -1606,6 +1670,7 @@ export default function jevRouterExtension(pi: ExtensionAPI): void {
 				rateIn: applied.rateIn,
 				prevRateIn: applied.prevRateIn,
 				confidence: decision.kind === "tier" ? decision.confidence : undefined,
+				needsContext: decision.kind === "tier" ? decision.needsContext : undefined,
 				reason: applied.reason,
 				latencyMs: decision.latencyMs,
 				prompt: text.slice(0, 120),

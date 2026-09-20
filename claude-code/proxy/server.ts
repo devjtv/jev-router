@@ -38,9 +38,9 @@ import {
 	loadConfig,
 	maskKey,
 	planRoute,
+	repoFacts,
 	resolveCreds,
 	truncatePrompt,
-	isBareContinuation,
 	type Decision,
 	type RouterConfig,
 } from "../../extensions/jev-router.ts";
@@ -54,6 +54,7 @@ import {
 	leakedToolSyntax,
 	modelFamily,
 	priorTurnContext,
+	workingDirectory,
 	providerPreference,
 	promptText,
 	sessionKey,
@@ -85,7 +86,7 @@ export type ProxyOptions = {
 	/** Overrides `cfg.claudeCode.upstream`. */
 	upstream?: string;
 	/** Test seam: replaces the Jev call. `prior` is the previous turn, when known. */
-	decide?: (prompt: string, cfg: RouterConfig, signal: AbortSignal, prior?: string) => Promise<Decision>;
+	decide?: (prompt: string, cfg: RouterConfig, signal: AbortSignal, prior?: string, repo?: string) => Promise<Decision>;
 	/**
 	 * Test seam for the OpenRouter credential: a string to use, `null` to act as
 	 * if none is configured. Omit to read the environment / secrets file.
@@ -163,6 +164,8 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 	const missingKeyWarned = new Set<string>();
 	/** Models already reported as returning tool calls in their own format. */
 	const suspectWarned = new Set<string>();
+	/** session id → project directory, learned from the statusline heartbeat. */
+	const sessionCwd = new Map<string, string>();
 	const sessions = new Map<string, SessionState>();
 	/** Fields a given upstream model has rejected with a 400, so later requests pre-strip them. */
 	const quirks = new Map<string, Set<CompatField>>();
@@ -182,17 +185,35 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 
 	const decide =
 		opts.decide ??
-		(async (prompt: string, c: RouterConfig, signal: AbortSignal, prior?: string): Promise<Decision> =>
+		(async (prompt: string, c: RouterConfig, signal: AbortSignal, prior?: string, repo?: string): Promise<Decision> =>
 			c.mode === "preflight"
-				? askPreflight(prompt, "", { timeoutMs: c.timeoutMs, signal })
-				: askTiers(prompt, "", c, { timeoutMs: c.timeoutMs, signal, ...(prior ? { priorContext: prior } : {}) }));
+				? askPreflight(prompt, repo ?? "", { timeoutMs: c.timeoutMs, signal })
+				: askTiers(prompt, "", c, { timeoutMs: c.timeoutMs, signal, ...(prior ? { priorContext: prior } : {}), ...(repo ? { repoContext: repo } : {}) }))
 
-	async function gate(prompt: string, priorContext?: string): Promise<Decision> {
+	/** Session cwd → repository facts for the gate, cached like the extension caches git. */
+	const repoFactsCache = new Map<string, { at: number; text: string }>();
+	function repoFactsFor(key: string): string | undefined {
+		const cwd = sessionCwd.get(key) ?? sessionCwd.get(key.split("/")[0]!);
+		if (!cwd) return undefined;
+		const hit = repoFactsCache.get(cwd);
+		if (hit && Date.now() - hit.at < 20_000) return hit.text;
+		let text = cwd;
+		try {
+			const res = Bun.spawnSync(["git", "status", "--porcelain=v1", "-b"], { cwd, stdout: "pipe", stderr: "ignore" });
+			if (res.exitCode === 0) text = repoFacts(cwd, res.stdout.toString());
+		} catch {
+			/* not a repo, or git absent: the path alone is still useful */
+		}
+		repoFactsCache.set(cwd, { at: Date.now(), text });
+		return text;
+	}
+
+	async function gate(prompt: string, priorContext?: string, repoContext?: string): Promise<Decision> {
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
 		const started = Date.now();
 		try {
-			return await decide(truncatePrompt(prompt, cfg.maxPromptChars), cfg, controller.signal, priorContext);
+			return await decide(truncatePrompt(prompt, cfg.maxPromptChars), cfg, controller.signal, priorContext, repoContext);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			if (cfg.log) log({ event: "gate_error", mode: cfg.mode, error: message, prompt: prompt.slice(0, 80) });
@@ -251,11 +272,7 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 			tier = undefined;
 			reason = `${(tokens ?? estimateTokens(body)).toLocaleString()} tokens exceeds maxRouteTokens — ${model}`;
 		} else {
-			const prior = priorTurnContext(body, cfg.priorContextChars);
-			decision = await gate(
-				isBareContinuation(prompt) && prior ? `${prompt}  [continues the previous turn — judge that work, not these words]` : prompt,
-				prior,
-			);
+			decision = await gate(prompt, priorTurnContext(body, cfg.priorContextChars), repoFactsFor(key));
 			const route = planRoute(decision, cfg, rng);
 			if (route.kind === "keep") {
 				reason = route.reason;
@@ -316,6 +333,7 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 				guarded,
 				contextTokens: tokens,
 				confidence: decision?.kind === "tier" ? decision.confidence : undefined,
+				needsContext: decision?.kind === "tier" ? decision.needsContext : undefined,
 				reason,
 				latencyMs: decision?.latencyMs,
 				prompt: prompt.slice(0, 120),
@@ -520,6 +538,22 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 				quirks: Object.fromEntries([...quirks].map(([m, s]) => [m, [...s]])),
 			});
 		}
+		if (req.method === "POST" && url.pathname === "/jev-router/session") {
+			// The statusline (already installed for most users) is the only part of
+			// Claude Code that knows the session's cwd. Learn it here so the gate can
+			// be given repository facts the request itself does not carry.
+			try {
+				const body = (await req.json()) as { sessionId?: unknown; cwd?: unknown };
+				if (typeof body.sessionId === "string" && typeof body.cwd === "string" && body.cwd) {
+					sessionCwd.set(body.sessionId, body.cwd);
+					if (sessionCwd.size > 200) sessionCwd.delete(sessionCwd.keys().next().value as string);
+					return Response.json({ ok: true, cwd: body.cwd });
+				}
+			} catch {
+				/* malformed heartbeat: ignore */
+			}
+			return Response.json({ ok: false }, { status: 400 });
+		}
 		if (req.method === "POST" && url.pathname === "/jev-router/reload") {
 			reload();
 			return Response.json({ ok: true, enabled: cfg.enabled, mode: cfg.mode, tiers: Object.keys(cfg.tiers) });
@@ -572,6 +606,8 @@ export function createProxy(opts: ProxyOptions = {}): Proxy {
 				lastBlocks: Array.isArray(last?.content) ? last.content.map((b: { type?: unknown }) => b?.type) : typeof last?.content,
 				tools: Array.isArray(body.tools) ? body.tools.length : 0,
 				maxTokens: body.max_tokens,
+				cwd: workingDirectory(body),
+				sysHits: (() => { const s = JSON.stringify(body.system ?? ""); return { dir: /director/i.test(s), cwd: /cwd/i.test(s), home: /\/Users|C:\\/i.test(s), sample: (s.match(/.{0,80}director.{0,140}/i) ?? ["none"])[0] }; })(),
 				deferred: Array.isArray(body.tools) ? body.tools.filter((t) => (t as { defer_loading?: unknown }).defer_loading === true).length : 0,
 				betas: req.headers.get("anthropic-beta") ?? undefined,
 			});

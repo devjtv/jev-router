@@ -325,8 +325,7 @@ export function claudeSettingsPath(env: NodeJS.ProcessEnv = process.env): string
 	return env.CLAUDE_CONFIG_DIR ? join(env.CLAUDE_CONFIG_DIR, "settings.json") : join(homedir(), ".claude", "settings.json");
 }
 
-/**
- * The `statusLine` entry that shows the current route inside Claude Code.
+/** The `statusLine` entry that shows the current route inside Claude Code.
  * Paths use forward slashes: Claude Code runs the command through a POSIX-style
  * shell even on Windows, where `C:\Users\…` would be read as escapes.
  */
@@ -565,6 +564,8 @@ export function writeClaudeSettings(
 /** The fields of Claude Code's statusline stdin JSON this renderer reads. */
 export type StatusLineInput = {
 	session_id?: string;
+	/** Claude Code's working directory for the session — the only place the proxy can learn it. */
+	cwd?: string;
 	model?: { id?: string; display_name?: string };
 	context_window?: { used_percentage?: number | null; context_window_size?: number };
 };
@@ -609,6 +610,17 @@ export async function statusLineCommand(): Promise<void> {
 	let sessions: StatusSessions | undefined;
 	const entry = readPidFile();
 	if (entry) {
+		// Claude Code tells the statusline the session's cwd and never tells the
+		// proxy. Report it, so the gate can be given repository facts that the
+		// request itself does not carry.
+		if (input.session_id && input.cwd) {
+			void fetch(`${entry.url}/jev-router/session`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ sessionId: input.session_id, cwd: input.cwd }),
+				signal: AbortSignal.timeout(400),
+			}).catch(() => {});
+		}
 		try {
 			const res = await fetch(`${entry.url}/jev-router/status`, { signal: AbortSignal.timeout(400) });
 			if (res.ok) sessions = ((await res.json()) as { sessions?: StatusSessions }).sessions ?? {};

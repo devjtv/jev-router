@@ -10,7 +10,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, askTiers, isBareContinuation, type RouterConfig } from "../extensions/jev-router.ts";
+import { DEFAULT_CONFIG, askTiers, isBareContinuation, repoFacts, type RouterConfig } from "../extensions/jev-router.ts";
 import { auditBins, chainedStatusLine, expectedBins, mergeClaudeSettings, readPidFile, renderStatusLine, serviceDefinition, statusLineSetting, writePidFile, BIN } from "../claude-code/proxy/daemon.ts";
 import { priorTurnContext } from "../claude-code/proxy/routing.ts";
 import { configPatch, patchConfigText } from "../claude-code/setup.ts";
@@ -135,6 +135,64 @@ describe("prior turn context", () => {
 		// The gate is told how to read a continuation.
 		const questions = bodies[0]!.questions as { tier: { instructions: { focus: string } } };
 		expect(questions.tier.instructions.focus).toContain("continues an earlier request");
+	});
+});
+
+describe("context Jev can ask for", () => {
+	test("repoFacts turns porcelain into a blast-radius line", () => {
+		const porcelain = "## main...origin/main\n M extensions/jev-router.ts\n?? claude-code/new.ts\n";
+		expect(repoFacts("/repo", porcelain)).toBe("/repo · branch main · 2 changed file(s): extensions/jev-router.ts, claude-code/new.ts");
+		expect(repoFacts("/repo", "## main\n")).toBe("/repo · branch main · 0 changed file(s)");
+		expect(repoFacts("/repo", undefined)).toBe("/repo"); // not a repo: the path is still a fact
+		const many = `## dev\n${Array.from({ length: 12 }, (_, i) => ` M file${i}.ts`).join("\n")}`;
+		expect(repoFacts("/repo", many)).toContain("(+4 more)");
+	});
+
+	test("askTiers re-asks once when Jev asks for repo facts it was offered", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		let call = 0;
+		const creds = { url: "https://example.invalid/decide", key: "k", model: "m" };
+		const fetchImpl = (async (_url: string, init: { body: string }) => {
+			bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+			call++;
+			// First pass: says the repo state is what would settle it.
+			if (call === 1) return Response.json({ answers: { tier: { choice: "standard", confidence: 0.5 }, context_request: { choice: "repo" } } });
+			return Response.json({ answers: { tier: { choice: "deep", confidence: 0.8 }, context_request: { choice: "none" } } });
+		}) as unknown as typeof fetch;
+		const d = await askTiers("add an endpoint", "", DEFAULT_CONFIG, {
+			creds,
+			timeoutMs: 1_000,
+			fetchImpl,
+			repoContext: "/repo · branch main · 9 changed file(s)",
+		});
+		expect(bodies).toHaveLength(2);
+		// Offered but withheld on the first call; supplied on the second.
+		expect((bodies[0]!.state as { repo_summary: string }).repo_summary).toBe("");
+		expect((bodies[1]!.state as { repo_summary: string }).repo_summary).toContain("9 changed file(s)");
+		expect(d.kind === "tier" && d.tier).toBe("deep");
+		expect(d.kind === "tier" && d.why).toContain("re-asked with repo facts");
+		expect(d.latencyMs).toBeGreaterThanOrEqual(0);
+	});
+
+	test("no second call when the context was not offered, or Jev did not ask", async () => {
+		const creds = { url: "https://example.invalid/decide", key: "k", model: "m" };
+		let calls = 0;
+		const asking = (async () => {
+			calls++;
+			return Response.json({ answers: { tier: { choice: "fast", confidence: 0.9 }, context_request: { choice: "repo" } } });
+		}) as unknown as typeof fetch;
+		// Asked for repo, but the caller has none to give → answer stands.
+		const a = await askTiers("go", "", DEFAULT_CONFIG, { creds, timeoutMs: 1_000, fetchImpl: asking });
+		expect(calls).toBe(1);
+		expect(a.kind === "tier" && a.needsContext).toBe("repo");
+
+		calls = 0;
+		const satisfied = (async () => {
+			calls++;
+			return Response.json({ answers: { tier: { choice: "fast", confidence: 0.9 }, context_request: { choice: "none" } } });
+		}) as unknown as typeof fetch;
+		await askTiers("rename foo", "", DEFAULT_CONFIG, { creds, timeoutMs: 1_000, fetchImpl: satisfied, repoContext: "/repo · branch main" });
+		expect(calls).toBe(1); // nothing asked, nothing spent
 	});
 });
 

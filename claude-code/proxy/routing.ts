@@ -331,6 +331,24 @@ export function priorTurnContext(body: MessagesBody, budgetChars: number): strin
 // hosts use one definition; re-exported here for the proxy and its tests.
 export { isBareContinuation } from "../../extensions/jev-router.ts";
 
+/**
+ * The working directory, when the request states one. Claude Code puts it in
+ * the system prompt's environment block, which is the only place it appears —
+ * the proxy sees requests, not the host's cwd.
+ */
+export function workingDirectory(body: MessagesBody): string | undefined {
+	const system = body.system;
+	const text =
+		typeof system === "string"
+			? system
+			: Array.isArray(system)
+				? (system as { text?: unknown }[]).map((b) => (typeof b?.text === "string" ? b.text : "")).join("\n")
+				: "";
+	if (!text) return undefined;
+	const m = /(?:primary working directory|working directory|cwd)\s*[:=]\s*([^\n"<>]+)/i.exec(text);
+	return m?.[1]?.trim() || undefined;
+}
+
 /** Detect an upstream 400 caused by a field the routed model does not accept,
  * so the proxy can strip it and retry instead of failing the turn. Order
  * matters: a `clear_thinking` complaint mentions thinking but is about

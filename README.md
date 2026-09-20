@@ -140,7 +140,7 @@ Jev decides from a **fixed, small state** — not the conversation:
 | `request` | the user's own text for this turn, truncated to `maxPromptChars` (1500) |
 | `prior_context` | the previous turn — the earlier request plus, where the host exposes it, the assistant's reply. Budget `priorContextChars` (1000); `0` disables |
 | `repo_summary` | OMP: `cwd · git branch · N changed files`. Claude Code: not yet (see below) |
-| `questions` | your tier rubrics — config, not context |
+| `questions` | your tier rubrics, plus `context_request` (what would settle it — see below) |
 
 Nothing else goes: no full history, no tool results, no file contents, no images
 (which is why `onImages` exists). Prior *assistant* text is available to the
@@ -158,9 +158,35 @@ plan's worth of work. Measured against the live gate:
 | *(none)* | `ok` | standard, 26% — treated as unclear |
 
 So the context is what makes a continuation cheap when the work was cheap *and*
-expensive when it was expensive. A bare continuation with no context is
-deliberately judged *unclear* rather than trivial, so ambiguity escalates
-instead of silently downgrading.
+expensive when it was expensive.
+
+### Jev can ask for what it is missing
+
+`go` was one symptom of a general problem: a request can be under-specified *for
+tiering* while being clear to someone who saw the last turn. So the gate has a
+third answer — a `context_request` naming what would settle it:
+
+- `none` — enough already
+- `prior_turn` — the previous turn would settle the size of the work
+- `repo` — branch, and which files are already modified, would settle the blast radius
+
+The router supplies what it **has** and asks once more (one extra call, never a
+loop); when it has nothing, the first answer stands and the turn records
+`needsContext` in the log line, so an expensive route is explainable instead of
+mysterious. Measured:
+
+| prompt | context offered | routed |
+| --- | --- | --- |
+| `add an endpoint` | none | **planner** (34%) — asked for `repo`, got nothing |
+| `add an endpoint` | dirty repo | **standard** (63%) — asked for `repo`, supplied, re-asked |
+| `clean this up` | dirty repo | **standard** (51%) |
+
+Repo facts are *offered, not sent* — the gate asks only when they would change
+the decision, so a dirty tree does not nudge every turn upward. In OMP the
+extension supplies them (`cwd · branch · changed files`); the Claude Code proxy
+learns the session's project directory from a statusline heartbeat (the one part
+of Claude Code that is told the cwd), so install the statusline — `env --write`
+does it — for repo-aware routing there.
 
 
 ## Cost and safety guards

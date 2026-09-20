@@ -507,7 +507,7 @@ describe("gateway model", () => {
 		expect(leakedToolSyntax("<tool_call>{\"name\":\"Read\"}</tool_call>")).toBe(true);
 	});
 
-	test("a bare continuation reaches the gate with the previous turn attached and labelled", async () => {
+	test("a bare continuation reaches the gate with the previous turn attached", async () => {
 		const seen: { prompt: string; prior?: string }[] = [];
 		const proxy = makeProxy({}, {}, {
 			decide: async (prompt, _cfg, _signal, prior) => {
@@ -521,11 +521,36 @@ describe("gateway model", () => {
 			{ role: "assistant", content: [{ type: "text", text: "Phase 1 interface, Phase 2 dual-write." }] },
 			{ role: "user", content: [{ type: "text", text: "go" }] },
 		]));
-		expect(seen[0]!.prompt).toContain("continues the previous turn");
+		expect(seen[0]!.prompt).toBe("go"); // the words are the words; the context carries the meaning
 		expect(seen[0]!.prior).toContain("plan the redis migration");
 		expect(seen[0]!.prior).toContain("Phase 1 interface"); // the plan itself, not just the ask
 		// The tier the gate chose is what the session pins.
 		expect(proxy.sessions.get("sess-1")?.tier).toBe("deep");
+	});
+
+	test("repo facts are offered, not sent, and the proxy learns the session's cwd from the statusline", async () => {
+		const seen: { prompt: string; prior?: string; repo?: string }[] = [];
+		const proxy = makeProxy({}, {}, {
+			decide: async (prompt, _cfg, _signal, prior, repo) => {
+				seen.push({ prompt, prior, repo });
+				return { kind: "tier", tier: "standard", latencyMs: 1, source: "stub" };
+			},
+		});
+		proxies.push(proxy);
+		// Claude Code tells the statusline the cwd; nothing else does.
+		const hb = await fetch(`${proxy.url}/jev-router/session`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ sessionId: "sess-1", cwd: process.cwd() }),
+		});
+		expect(hb.status).toBe(200);
+		await post(proxy.url, body([user("add a health endpoint")]));
+		// Offered on the first call, so Jev can ask for it — but the initial
+		// request state stays small.
+		expect(seen[0]!.repo).toContain(process.cwd());
+		// A malformed heartbeat is refused rather than stored.
+		const bad = await fetch(`${proxy.url}/jev-router/session`, { method: "POST", body: JSON.stringify({ sessionId: "x" }) });
+		expect(bad.status).toBe(400);
 	});
 
 	test("a real request gets the context but is not labelled a continuation", async () => {
