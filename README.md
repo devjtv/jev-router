@@ -198,10 +198,25 @@ the model is touched. All are pure functions with unit tests.
 after a model change re-reads the whole conversation uncached — on a long
 session that can cost more than the cheaper model saves. Above
 `cacheGuardTokens` (default 60k) a cross-model switch is demoted: the **effort**
-still changes, the **model** stays put, so the cache survives. `same-family`
-allows switches within one lineage, `keep` refuses outright, `off` disables it.
-Staying on the current model never calls `setModel` at all — a same-model call
-would be the very thing the guard exists to prevent.
+still changes, the **model** stays put. `same-family` allows switches within one
+lineage, `keep` refuses outright, `off` disables it. Staying on the current model
+never calls `setModel` at all — a same-model call would be the very thing the
+guard exists to prevent.
+
+Measured, and worth knowing before trusting "effort-only": **an effort change
+misses the cache too.** Same prompts, real API, `low → high → low`:
+
+```
+effort=low    cache read 0       created 27186     (cold: builds it)
+effort=high   cache read 0       created 26549     (miss: re-read + re-created)
+effort=low    cache read 27186   created 0         (hit: matched the low entry)
+```
+
+The third row is the proof: it matched the *low-effort* entry, so the cache key
+distinguishes effort levels. So effort-only is not free — it is the cheaper of
+two re-reads, because it pays the **current** model's input rate instead of the
+new model's. Changing nothing is the only genuinely cheap option, which is what
+`cacheGuardMode: "keep"` gives you.
 
 **2. Images.** A text-only model cannot serve an image turn, and the gate only
 reads the prompt's *text*, so it would be routing on a partial view. With

@@ -676,8 +676,14 @@ export type CacheVerdict =
  * Providers key the cache per model, so the first request after a model change
  * re-reads the entire conversation uncached. Above `cacheGuardTokens` that
  * re-read usually dominates whatever the cheaper model saves — so the guard
- * demotes a cross-model switch to an effort-only change (which keeps the cache)
- * or refuses it outright, depending on `cacheGuardMode`.
+ * demotes a cross-model switch to an effort-only change, or refuses it outright.
+ *
+ * Measured (real API, identical prompts): **an effort change also misses the
+ * cache** — `low → high → low` gave read=0/created=27k, read=0/created=26.5k,
+ * read=27k/created=0, so the cache key distinguishes effort levels. Effort-only
+ * is therefore not free; it is chosen because it re-reads at the *current*
+ * model's rate rather than the new model's, which is the cheaper of two
+ * re-reads. Changing nothing is the only genuinely cheap option.
  */
 export function cacheGuard(opts: {
 	tokens: number | undefined;
