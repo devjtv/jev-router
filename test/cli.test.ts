@@ -194,6 +194,27 @@ describe("context Jev can ask for", () => {
 		await askTiers("rename foo", "", DEFAULT_CONFIG, { creds, timeoutMs: 1_000, fetchImpl: satisfied, repoContext: "/repo · branch main" });
 		expect(calls).toBe(1); // nothing asked, nothing spent
 	});
+
+	test("a failed re-ask keeps the first answer rather than falling back to the costliest tier", async () => {
+		const creds = { url: "https://example.invalid/decide", key: "k", model: "m" };
+		let calls = 0;
+		const flaky = (async () => {
+			calls++;
+			if (calls === 1) {
+				return Response.json({ answers: { tier: { choice: "standard", confidence: 0.7 }, context_request: { choice: "repo" } } });
+			}
+			throw new Error("network down");
+		}) as unknown as typeof fetch;
+		const d = await askTiers("add an endpoint", "", DEFAULT_CONFIG, {
+			creds,
+			timeoutMs: 1_000,
+			fetchImpl: flaky,
+			repoContext: "/repo · branch main · 3 changed file(s)",
+		});
+		expect(calls).toBe(2); // it did try
+		expect(d.kind === "tier" && d.tier).toBe("standard"); // not DEFAULT_CONFIG.fallbackTier
+		expect(d.kind === "tier" && d.why).toContain("re-ask failed");
+	});
 });
 
 describe("CLI dispatch", () => {

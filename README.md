@@ -308,7 +308,7 @@ Environment overrides: `JEV_ROUTER_CONFIG`, `JEV_ROUTER_LOG`,
 ## Verifying
 
 ```bash
-bun test              # 127 tests: config merge, guards, tier/role mapping, YAML seeding, CC hook, CC gateway proxy, CLI/daemon
+bun test              # 168 tests: config merge, guards, tier/role mapping, YAML seeding, CC hook, CC gateway proxy, CLI/daemon, key command
 bun test/live.ts      # real Jev calls + a stub host: proves setModel/setThinkingLevel fire,
                       # and that each guard holds when the route is real
 bun test/live.ts preflight

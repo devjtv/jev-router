@@ -13,5 +13,5 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true
   },
-  "include": ["extensions/**/*.ts", "test/**/*.ts", "types/**/*.d.ts", "scripts/**/*.ts"]
+  "include": ["extensions/**/*.ts", "test/**/*.ts", "types/**/*.d.ts", "scripts/**/*.ts", "bin/**/*.ts", "claude-code/**/*.ts"]
 }

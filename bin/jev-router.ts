@@ -39,7 +39,7 @@ import {
 	type Status,
 } from "../claude-code/proxy/daemon.ts";
 import { claudeEnv, claudeSettings } from "../claude-code/proxy/server.ts";
-import { setup, modelsCommand, pickOpenRouterModel, setTierModel } from "../claude-code/setup.ts";
+import { setup, pickOpenRouterModel, setTierModel } from "../claude-code/setup.ts";
 import { OR_PREFIX, describeModel, describeVariant, hasOpenRouterKey, isOpenRouterSpec, loadModels, openRouterVariant, searchModels, withVariant, type OrVariant } from "../claude-code/proxy/openrouter.ts";
 import { tierModel } from "../claude-code/proxy/routing.ts";
 

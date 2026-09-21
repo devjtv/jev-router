@@ -1216,10 +1216,17 @@ export async function askTiers(
 	// never a second call without Jev having asked.
 	let supplied: string | undefined;
 	if (wanted === "repo" && opts.repoContext && opts.repoContext !== repoSummary) {
-		const second = await callDecisions(creds, build(prior, opts.repoContext), questions, opts);
-		answers = second.answers;
-		latencyMs += second.latencyMs;
-		supplied = "repo";
+		try {
+			const second = await callDecisions(creds, build(prior, opts.repoContext), questions, opts);
+			answers = second.answers;
+			latencyMs += second.latencyMs;
+			supplied = "repo";
+		} catch (err) {
+			// The first answer is still an answer. A failed re-ask (timeout, the
+			// caller's abort, a transient 5xx) must not turn a usable tier into a
+			// fallback-to-the-costliest turn.
+			supplied = `repo re-ask failed (${err instanceof Error ? err.message : String(err)})`;
+		}
 	}
 	const tier = answers.tier?.choice ?? "";
 	if (!tier || !cfg.tiers[tier]) {
@@ -1232,7 +1239,7 @@ export async function askTiers(
 		};
 	}
 	const missing = answers.missing_decision?.choice;
-	const why = [missing && missing !== "none" ? `unstated ${missing}` : undefined, supplied ? `re-asked with ${supplied} facts` : undefined]
+	const why = [missing && missing !== "none" ? `unstated ${missing}` : undefined, supplied ? (supplied === "repo" ? "re-asked with repo facts" : supplied) : undefined]
 		.filter(Boolean)
 		.join(" · ");
 	return {
@@ -1738,7 +1745,11 @@ export default function jevRouterExtension(pi: ExtensionAPI): void {
 						return;
 					}
 					const chosen: GateProvider = providerArg === "typesafe" || providerArg === "openrouter" ? providerArg : cfg.gate.provider;
-					const value = rest.filter((a, i) => i !== providerFlag && i !== providerFlag + 1).join(" ").trim();
+					// Drop the flag and its value *only when the flag is present*: `-1 + 1`
+					// is `0`, so an unguarded index filter silently ate the first token —
+					// the key itself — and the command reported "no key configured".
+					const flagIndexes = providerFlag >= 0 ? new Set([providerFlag, providerFlag + 1]) : undefined;
+					const value = rest.filter((_a, i) => !flagIndexes?.has(i)).join(" ").trim();
 					if (!value) {
 						const creds = resolveCreds(process.env, cfg.gate);
 						say(
