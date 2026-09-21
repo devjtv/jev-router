@@ -342,6 +342,19 @@ Subagent routing (above) was verified separately against an `omp -p` run that
 spawned a `scout` subagent, and shadow mode plus stats against a headless run
 whose log showed `switched:false, shadowed:true` with real catalog rates.
 
+**Two sessions, one daemon.** Two Claude Code sessions run in parallel through a
+single proxy keep independent pins — routing is keyed by the session id, so a
+trivial prompt and a planning prompt in flight together do not share a tier:
+
+```
+{"sid":"038a26ab","tier":"fast",   "model":"anthropic/claude-haiku-4-5"}   ← "reply with the single word alpha"
+{"sid":"3550b0fc","tier":"planner","model":"anthropic/claude-opus-5"}      ← "plan a migration of the session store…"
+```
+
+(Caveat from that run: the second session's model call came back as a claude.ai
+session limit, not a completion — the routing decision and model rewrite were
+verified, the generation was refused upstream.)
+
 Live output at the time of writing (mode `tiers`, `pick: first`):
 
 ```
